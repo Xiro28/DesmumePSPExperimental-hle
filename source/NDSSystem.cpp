@@ -16,6 +16,7 @@
 	along with the this software.  If not, see <http://www.gnu.org/licenses/>.
 */
 
+#include "PSP/pspDmac.h"
 #include "NDSSystem.h"
 
 #include <string.h>
@@ -1808,6 +1809,13 @@ void NDS_exec(s32 nb)
 	}
 
 	if (IsEmu()){
+		// GPU_RenderLine draws into GPU_Screen/GPU_Screen_extra, but EMU_SCREEN
+		// samples VRAM at DISP_POINTER (0x44100000). Copy them across first --
+		// without this the frame is rendered somewhere the display never reads.
+		const int sz_SCR = 512 * 192 * 2;
+		sceDmacMemcpy((void*)(0x04100000), (void*)&GPU_Screen[0], sz_SCR);
+		sceDmacMemcpy((void*)(0x04100000 + sz_SCR), (void*)&GPU_Screen_extra[0], sz_SCR);
+
 		renderScreenFull();
 		EMU_SCREEN();
 	}
