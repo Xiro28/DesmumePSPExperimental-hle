@@ -2298,6 +2298,18 @@ template<int PROCNUM> static void execHardware_interrupts_core()
 
 void execHardware_interrupts()
 {
+	if (sequencer.nds_vblankEnded)
+	{
+		disp_fifo.head = disp_fifo.tail = 0;
+
+		// Events parked with pending=1 (addToEvent / updateEvent<...,false>) only
+		// come back on the ordered list here. Without this the GX FIFO event never
+		// returns and 3D stops being processed.
+		sequencer.resolve_pendings();
+
+		sequencer.nds_vblankEnded = false;
+	}
+
 	if (!ARM9_SKIP_HACK) execHardware_interrupts_core<ARMCPU_ARM9>();
 	if (!ARM7_SKIP_HACK) execHardware_interrupts_core<ARMCPU_ARM7>();
 }
