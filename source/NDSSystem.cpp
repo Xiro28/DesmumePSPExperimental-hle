@@ -1367,6 +1367,7 @@ struct Sequencer
     }
 
 
+
     s32 popNext(EventID &outEvent) {
 		s32 currentHead = head;
         if (currentHead == -1) {
@@ -2152,6 +2153,14 @@ void exec_cpu()
 	// instead deadlocks the pair: they talk over IPC, so the ARM9 must get a turn
 	// to answer while the ARM7 waits.
 	s32 timer = std::min(arm9, arm7);
+
+	// popNext() returns the head event's distance from nds_timer. If that is
+	// already <= timer the event is due, but execHardware only fires on
+	// nds_timer >= timestamp -- so with both at 0 nothing ran and nothing
+	// advanced: the loop spun forever. Step time forward by at least one
+	// cycle so the event becomes reachable.
+	if (s32next <= timer)
+		s32next = timer + 1;
 
 	while (timer < s32next && NDS_ReschedulePtr == 0)
 	{
