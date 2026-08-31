@@ -336,17 +336,18 @@ int main(int argc, char **argv) {
   while(execute)
   {
       
-    if (my_config.frameskip == 0) 
-      desmume_cycle();
-    else{
-  
-      if (_frameskip--) {
-        desmume_cycle();
-        NDS_SkipNextFrame();
-      } else {
-        _frameskip = my_config.frameskip;
-      }
+    // desmume_cycle() is where input is read (process_ctrls_event) and the
+    // touch state applied, so it has to run every frame. The old shape skipped
+    // it entirely on the frame that reloaded the counter, which made the touch
+    // drop out whenever frameskip was on.
+    desmume_cycle();
 
+    if (my_config.frameskip != 0)
+    {
+      if (_frameskip--)
+        NDS_SkipNextFrame();
+      else
+        _frameskip = my_config.frameskip;
     }
 
     u32 curr_timing = sceKernelGetSystemTimeLow();
