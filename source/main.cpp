@@ -158,6 +158,11 @@ constexpr int max_framerate[] = {
 // Called once per frame by the sequencer at the end of vblank. Everything that
 // used to live in main()'s while-loop happens here now: input, frame pacing and
 // the FPS counter.
+// Provided by NDSSystem.cpp / GPU.cpp for the per-frame draw below.
+extern void renderScreenFull();
+extern volatile u8 __attribute__((aligned(16))) *GPU_Screen;
+extern volatile u8 __attribute__((aligned(16))) *GPU_Screen_extra;
+
 void desmume_cycle()
 {
 	u16 pad = 0;
@@ -211,11 +216,30 @@ void desmume_cycle()
 			previous_time = curr_timing;
 	}
 
+
+	// Draw the frame. This used to sit in NDS_exec; with the ported sequencer
+	// all host-side per-frame work happens here.
+	//
+	// GPU_RenderLine writes into GPU_Screen/GPU_Screen_extra (memalign'd), but
+	// EMU_SCREEN samples VRAM at DISP_POINTER, so copy them across first.
+	{
+		const int sz_SCR = 512 * 192 * 2;
+		sceDmacMemcpy((void*)(0x04100000), (void*)&GPU_Screen[0], sz_SCR);
+		sceDmacMemcpy((void*)(0x04100000 + sz_SCR), (void*)&GPU_Screen_extra[0], sz_SCR);
+
+		renderScreenFull();
+		EMU_SCREEN(false, false);   // draw both; frameskip is applied above
+	}
+
 	if (my_config.showfps)
 		ShowFPS(0, 3);
 
 	if (my_config.enable_sound)
 		SPU_Emulate_user();
+
+	// The ported PSPDisplay presents here: its double-buffer scheme moved
+	// sceGuSwapBuffers() out of EMU_SCREEN and into Finish.
+	EMU_SCREEN_Finish();
 }
 
 
