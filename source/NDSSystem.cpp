@@ -2438,6 +2438,29 @@ void NDS_setPad(bool R,bool L,bool D,bool U,bool T,bool S,bool B,bool A,bool Y,b
 	rawButtons.G = G;
 	rawButtons.F = F;
 }
+// Direct variants: write the touch state straight into nds.*, the way the
+// fork's input path does. The buffered NDS_setTouchPos() below only fills
+// rawUserInput, which is applied by NDS_applyFinalInput() -- and the ported
+// ctrlssdl uses NDS_applyFinalInputDirect(), which never runs that.
+void NDS_setTouchPosDirect(u16 x, u16 y)
+{
+	nds.adc_touchX = NDS_getADCTouchPosX(x);
+	nds.adc_touchY = NDS_getADCTouchPosY(y);
+
+	nds.scr_touchX = x << 4;
+	nds.scr_touchY = y << 4;
+	nds.hw_status.Touching = 1;
+}
+
+void NDS_releaseTouchDirect(void)
+{
+	nds.adc_touchX = 0;
+	nds.adc_touchY = 0;
+	nds.scr_touchX = 0;
+	nds.scr_touchY = 0;
+	nds.hw_status.Touching = 0;
+}
+
 void NDS_setTouchPos(u16 x, u16 y)
 {
 	gotInputRequest();

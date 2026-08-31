@@ -255,9 +255,12 @@ public:
 // The thing is that it might be some cycles off compared to the real implementation since some functions issues the reschedule 4 times while others just 1
 // A partial good solution is to update the cycles by 2, which I find to be a good compromise
 
-// Disable those
-#define GFX_DELAY(x) {}
-#define GFX_DELAY_M2(x) {}
+// The fork disables these (see XIRO's note above) because its new sequencer
+// updates the GX timing differently. This tree still has the upstream
+// scheduler, where 42 call sites rely on GFX_DELAY to charge FIFO time -- with
+// them empty a game that waits on the GX FIFO never sees it drain.
+#define GFX_DELAY(x) NDS_RescheduleGXFIFO(1);
+#define GFX_DELAY_M2(x) NDS_RescheduleGXFIFO(1);
 
 // baseline signature is NDS_RescheduleGXFIFO(u32 cost) -- the fork's second
 // 'update' argument came with its new sequencer, which is not ported yet.

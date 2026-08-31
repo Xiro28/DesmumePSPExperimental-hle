@@ -160,10 +160,10 @@ static void desmume_cycle()
     /* Update mouse position and click */
 	  if (!mouse.click)
 	  {
-      NDS_releaseTouch();
+      NDS_releaseTouchDirect();
 	  }
 	  else {
-		   NDS_setTouchPos(mouse.x, mouse.y);
+		   NDS_setTouchPosDirect(mouse.x, mouse.y);
 	  }
 
     // Pad state is applied by process_ctrls_event() above (the ported ctrlssdl
