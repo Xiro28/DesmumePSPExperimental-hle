@@ -29,15 +29,19 @@
 #include <pspctrl.h>
 #include <pspdisplay.h>
 #include <pspkernel.h>
+#include <pspdebug.h>
+#include <psppower.h>
 
+#include "armcpu.h"
 #include "GPU.h"
+#include "PSP/PSPDisplay.h"
 
 #define NB_KEYS 12
 
-const u16 default_psp_cfg_h[NB_KEYS] =
+const u32 default_psp_cfg_h[NB_KEYS] =
   { PSP_CTRL_CIRCLE,    //A
 	PSP_CTRL_CROSS,     //B
-	PSP_CTRL_SELECT,	//Select
+	PSP_CTRL_SELECT|PSP_CTRL_HOME,	//Select
 	PSP_CTRL_START,		//Start
 	PSP_CTRL_RIGHT,		//Right
 	PSP_CTRL_LEFT,		//Left
@@ -73,29 +77,6 @@ u8* GetFrameBuffer() {
 	return (u8*)(VRAM_START + top_padding);
 }
 
-void DrawCursor(unsigned int x, unsigned int y)
-{
-	return;
-	unsigned int fontAddr = 0;
-	//short shCurrentCursorColor = 0;
-
-	for (unsigned int yy = 0; yy < 4; yy++)
-	{
-		u8* framebuf = (GetFrameBuffer() + ((yy + y) * 1024)) + 512;
-
-		for (unsigned int xx = 0; xx < 8; xx++)
-		{
-			if (achCursor[fontAddr])
-				*(framebuf + (x + xx)) = ashCursorColors[0];
-			else
-				*(framebuf + (x + xx)) = ashCursorColors[2];
-
-			fontAddr++;
-		}
-	}
-
-	//*(GetFrameBuffer() + (5 +(3 + y) * 1024)) = ashCursorColors[(shCurrentCursorColor+1)%MAX_CURSOR_COLORS];
-}
 
 /* Load default joystick and keyboard configurations */
 void load_default_config(const u16 kbCfg[]){}
@@ -142,85 +123,17 @@ static void set_mouse_coord(signed long x,signed long y)
  // mouse.psp_y = mouse.y;
 }
 
-// Adapted from Windows port
-bool allowUpAndDown = false;
-static buttonstruct<int> cardinalHeldTime = {0};
-
-static void RunAntipodalRestriction(const buttonstruct<bool>& pad)
-{
-	if(allowUpAndDown)
-		return;
-
-	pad.U ? (cardinalHeldTime.U++) : (cardinalHeldTime.U=0);
-	pad.D ? (cardinalHeldTime.D++) : (cardinalHeldTime.D=0);
-	pad.L ? (cardinalHeldTime.L++) : (cardinalHeldTime.L=0);
-	pad.R ? (cardinalHeldTime.R++) : (cardinalHeldTime.R=0);
-}
-static void ApplyAntipodalRestriction(buttonstruct<bool>& pad)
-{
-	if(allowUpAndDown)
-		return;
-
-	// give preference to whichever direction was most recently pressed
-	if(pad.U && pad.D)
-		if(cardinalHeldTime.U < cardinalHeldTime.D)
-			pad.D = false;
-		else
-			pad.U = false;
-	if(pad.L && pad.R)
-		if(cardinalHeldTime.L < cardinalHeldTime.R)
-			pad.R = false;
-		else
-			pad.L = false;
-}
-
-/* Update NDS keypad */
-void update_keypad(u16 keys)
-{
-	// Set raw inputs
-	{
-		buttonstruct<bool> input = {};
-		input.G = (keys>>12)&1;
-		input.E = (keys>>8)&1;
-		input.W = (keys>>9)&1;
-		input.X = (keys>>10)&1;
-		input.Y = (keys>>11)&1;
-		input.A = (keys>>0)&1;
-		input.B = (keys>>1)&1;
-		input.S = (keys>>3)&1;
-		input.T = (keys>>2)&1;
-		input.U = (keys>>6)&1;
-		input.D = (keys>>7)&1;
-		input.L = (keys>>5)&1;
-		input.R = (keys>>4)&1;
-		input.F = (keys>>14)&1;
-		RunAntipodalRestriction(input);
-		NDS_setPad(
-			input.R, input.L, input.D, input.U,
-			input.T, input.S, input.B, input.A,
-			input.Y, input.X, input.W, input.E,
-			input.G, input.F);
-	}
-
-	// Set real input
-	NDS_beginProcessingInput();
-	{
-		UserButtons& input = NDS_getProcessingUserInput().buttons;
-		ApplyAntipodalRestriction(input);
-	}
-	NDS_endProcessingInput();
-}
 
 /* Retrieve current NDS keypad */
 u16 get_keypad( void)
 {
   u16 keypad;
-  keypad = ~MMU.ARM7_REG[0x136];
+  keypad = MMU.ARM7_REG[0x136];
   keypad = (keypad & 0x3) << 10;
 #ifdef WORDS_BIGENDIAN
   keypad |= ~(MMU.ARM9_REG[0x130] | (MMU.ARM9_REG[0x131] << 8)) & 0x3FF;
 #else
-  keypad |= ~((u16 *)MMU.ARM9_REG)[0x130>>1] & 0x3FF;
+  keypad |= ((u16 *)MMU.ARM9_REG)[0x130>>1] & 0x3FF;
 #endif
   return keypad;
 }
@@ -230,7 +143,7 @@ typedef struct{
 	int var;
 }option;
 
-option Options[] = {{"Resume",-1},{"Change Rom",-1},{"Reset Rom",-1},{"Save State",-1},{"Load State",-1},{"Emu Config",-1},{"Exit",-1}};
+option Options[] = {{"Resume",-1},{"Change Rom",-1},{"Reset Rom",-1},{"Save State",-1},{"Load State",-1},{"Rom Settings",-1},{"Exit",-1}};
 
 u8 curr_index = 0;
 u8 N_options = 7;
@@ -239,11 +152,11 @@ bool menu_quit = false;
 void MenuAction(){
 	switch(curr_index){
 		case 1:
-			ChangeRom(true); 
+			ChangeRom(true);
 		break;
-		
+
 		case 2:
-			ResetRom(); 
+			ResetRom();
 		break;
 
 		case 3:
@@ -255,81 +168,49 @@ void MenuAction(){
 		break;
 
 		case 5:
-			EMU_Conf();
+		{
+			extern void RomSettingsMenu();
+			RomSettingsMenu();
+		}
 		break;
 
 		case 6:
-			sceKernelExitGame();
+		extern void deinit ();
+		deinit();
 		return;
 	}
 
 	menu_quit = true;
 }
 
-void MenuOption(){
-	pspDebugScreenSetXY(0, 3);
-
-	for(u8 i = 0;i < N_options;i++){
-		pspDebugScreenSetTextColor(0xffffffff);
-
-		if (i == curr_index)
-			pspDebugScreenSetTextColor(0x0000ffff);
-
-	    if (Options[i].var == -1)
-			pspDebugScreenPrintf("  %s \n",Options[i].name);
-		else
-			pspDebugScreenPrintf("  %s :  %d\n",Options[i].name,Options[i].var);
-	}
-
-	pspDebugScreenSetTextColor(0xffffffff);
-	
-}
-
-void Menu(){	
-	SceCtrlData pad,oldPad;
+void Menu(){
+	SceCtrlData pad, oldPad = {0};
 	menu_quit = false;
 	curr_index = 0;
 
-	pspDebugScreenClear();
+	while (!menu_quit) {
+		DrawPauseMenu(curr_index);
 
-	while(!menu_quit){
-	
-	sceDisplayWaitVblankStart();
-	MenuOption();
-
-	if(sceCtrlPeekBufferPositive(&pad, 1))
-		{
-			if (pad.Buttons != oldPad.Buttons)
-			{
-				if (pad.Buttons & PSP_CTRL_UP){
-					--curr_index;
-					if (curr_index < 0) curr_index = 0;
-				}
-				if (pad.Buttons & PSP_CTRL_DOWN){
+		if (sceCtrlPeekBufferPositive(&pad, 1)) {
+			if (pad.Buttons != oldPad.Buttons) {
+				if (pad.Buttons & PSP_CTRL_UP)
+					curr_index = (curr_index == 0) ? (N_options - 1) : (curr_index - 1);
+				if (pad.Buttons & PSP_CTRL_DOWN) {
 					++curr_index;
-					if (curr_index > N_options-1) curr_index = 0;
+					if (curr_index > N_options - 1) curr_index = 0;
 				}
-				if (pad.Buttons & PSP_CTRL_CROSS){
+				if (pad.Buttons & PSP_CTRL_CROSS)
 					MenuAction();
-				}
-				 if (pad.Buttons & PSP_CTRL_CIRCLE){
-					 pspDebugScreenClear();
-
-					 if (my_config.frameskip == 0)
-						 my_config.frameskip++; //Add one more Frameskip if it's set to 0. We need at least one to process input.
+				if (pad.Buttons & PSP_CTRL_CIRCLE)
 					return;
-	  			}
 			}
-
 			oldPad = pad;
 		}
 	}
-
-	pspDebugScreenClear();
 }
 
 extern bool ARM7_SKIP_HACK;
-
+extern armcpu_t NDS_ARM9;
 void
 //process_ctrls_event( SDL_Event& event,
 process_ctrls_event(u16 &keypad)
@@ -339,50 +220,55 @@ process_ctrls_event(u16 &keypad)
 	  sceCtrlSetSamplingMode(PSP_CTRL_MODE_ANALOG);
 	  sceCtrlPeekBufferPositive(&pad, 1); 
 
-	  if (pad.Lx < 10) {
-		  --mouse.x; --mouse.x;
-		  --mouse.x; --mouse.x;
-	  }
+	  //printf("ARM9 PC: %08x, CPSR: %08x\n", NDS_ARM9.R[15], NDS_ARM9.CPSR);
 
-	  if (pad.Lx > 245) {
-		  ++mouse.x; ++mouse.x;
-		  ++mouse.x; ++mouse.x;
-	  }
+	  mouse.click = FALSE;
 
-	  if (pad.Ly < 10) {
-		  --mouse.y; --mouse.y;
-		  --mouse.y; --mouse.y;
-	  }
+	  // Wrap around the DS touch screen (256x192): going past an edge makes the
+	  // cursor reappear on the opposite side. Compute in int and use a positive
+	  // modulo so negative values wrap correctly (C's % keeps the sign).
+	  int mx = mouse.x;
+	  int my = mouse.y;
 
-	  if (pad.Ly > 245) {
-		  ++mouse.y; ++mouse.y;
-		  ++mouse.y; ++mouse.y;
-	  }
+	  if (pad.Lx < 10)  mx -= 4;
+	  if (pad.Lx > 245) mx += 4;
+	  if (pad.Ly < 10)  my -= 4;
+	  if (pad.Ly > 245) my += 4;
+
+	  mx = ((mx % 256) + 256) % 256;   // 0..255
+	  my = ((my % 192) + 192) % 192;   // 0..191
+
+	  mouse.x = (u8)mx;
+	  mouse.y = (u8)my;
 
 	  set_mouse_coord(mouse.x, mouse.y);
 
-	  if (pad.Buttons & PSP_CTRL_RTRIGGER && pad.Buttons & PSP_CTRL_TRIANGLE) {
-	  	ARM7_SKIP_HACK = !ARM7_SKIP_HACK;
-		return;
-	  }
+	  const bool select_combo = (pad.Buttons & PSP_CTRL_HOME) && (pad.Buttons & PSP_CTRL_SELECT);
 
-	  if (pad.Buttons & PSP_CTRL_RTRIGGER && pad.Buttons & PSP_CTRL_CIRCLE) {
+	  if (pad.Buttons & PSP_CTRL_HOME && !select_combo) {
+		Menu();
+	  }	else if (pad.Buttons & PSP_CTRL_SELECT) {
 	  	mouse.click = TRUE;
-		return;
-	  }else{
-		mouse.click = FALSE;
-	  }
+	  }	else{
+			u16	nds_pad	= (0 |
+				(((pad.Buttons & default_psp_cfg_h[0]) ? 0 : 0x80) >> 7) |
+				(((pad.Buttons & default_psp_cfg_h[1]) ? 0 : 0x80) >> 6) |
+				(((pad.Buttons & default_psp_cfg_h[2]) ? 0 : 0x80) >> 5) |
+				(((pad.Buttons & default_psp_cfg_h[3]) ? 0 : 0x80) >> 4) |
+				(((pad.Buttons & default_psp_cfg_h[4]) ? 0 : 0x80) >> 3) |
+				(((pad.Buttons & default_psp_cfg_h[5]) ? 0 : 0x80) >> 2) |
+				(((pad.Buttons & default_psp_cfg_h[6]) ? 0 : 0x80) >> 1) |
+				(((pad.Buttons & default_psp_cfg_h[7]) ? 0 : 0x80)     ) |
+				(((pad.Buttons & default_psp_cfg_h[8]) ? 0 : 0x80) << 1) |
+				(((pad.Buttons & default_psp_cfg_h[9]) ? 0 : 0x80) << 2)) ;
 
-	  if (pad.Buttons & PSP_CTRL_HOME) {
-		  Menu();
+			u16 padExt = (((pad.Buttons & default_psp_cfg_h[10])? 0 : 0x80) >> 7) |
+				(((pad.Buttons & default_psp_cfg_h[11]) ? 0 : 0x80) >> 6) |
+				(((pad.Buttons & default_psp_cfg_h[12]) ? 0 : 0x80) >> 4) |
+				((0) << 7) |
+				0x0034;
+						
+			NDS_applyFinalInputDirect(nds_pad, padExt);
 	  }
 	  
-
-	  for(int i=0;i<12;i++) {
-
-		if (pad.Buttons & default_psp_cfg_h[i])
-			ADD_KEY(keypad, KEYMASK_(i));
-		else
-			RM_KEY(keypad, KEYMASK_(i));
-	  }
 }

@@ -2447,6 +2447,54 @@ void NDS_setMic(bool pressed)
 }
 
 
+// Writes the pad registers straight through, instead of going via the
+// NDS_setPad(...) bool list. Ported from the -hle tree together with the
+// ctrlssdl input path that calls it.
+void NDS_applyFinalInputDirect(u16 pad, u16 padExt)
+{
+
+	((u16 *)MMU.ARM9_REG)[0x130 >> 1] = (u16)pad;
+	((u16 *)MMU.ARM7_REG)[0x130 >> 1] = (u16)pad;
+
+	u16 k_cnt = ((u16 *)MMU.ARM9_REG)[0x132 >> 1];
+	if (k_cnt & (1 << 14))
+	{
+		// INFO("ARM9: KeyPad IRQ (pad 0x%04X, cnt 0x%04X (condition %s))\n", pad, k_cnt, k_cnt&(1<<15)?"AND":"OR");
+		u16 k_cnt_selected = (k_cnt & 0x3F);
+		if (k_cnt & (1 << 15)) // AND
+		{
+			if ((~pad & k_cnt_selected) == k_cnt_selected)
+				NDS_makeIrq(ARMCPU_ARM9, IRQ_BIT_KEYPAD);
+		}
+		else // OR
+		{
+			if (~pad & k_cnt_selected)
+				NDS_makeIrq(ARMCPU_ARM9, IRQ_BIT_KEYPAD);
+		}
+	}
+
+	k_cnt = ((u16 *)MMU.ARM7_REG)[0x132 >> 1];
+	if (k_cnt & (1 << 14))
+	{
+		// INFO("ARM7: KeyPad IRQ (pad 0x%04X, cnt 0x%04X (condition %s))\n", pad, k_cnt, k_cnt&(1<<15)?"AND":"OR");
+		u16 k_cnt_selected = (k_cnt & 0x3F);
+		if (k_cnt & (1 << 15)) // AND
+		{
+			if ((~pad & k_cnt_selected) == k_cnt_selected)
+				NDS_makeIrq(ARMCPU_ARM7, IRQ_BIT_KEYPAD);
+		}
+		else // OR
+		{
+			if (~pad & k_cnt_selected)
+				NDS_makeIrq(ARMCPU_ARM7, IRQ_BIT_KEYPAD);
+		}
+	}
+
+	padExt |= (((u16 *)MMU.ARM7_REG)[0x136 >> 1] & 0x0070);
+
+	((u16 *)MMU.ARM7_REG)[0x136 >> 1] = (u16)padExt;
+}
+
 static void NDS_applyFinalInput();
 
 

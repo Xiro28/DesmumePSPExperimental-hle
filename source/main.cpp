@@ -144,18 +144,12 @@ void PrintfXY(const char* text, int x, int y) {
 	pspDebugScreenPrintf(text);
 }
 
-void DrawTouchPointer()
+// Called by the ported ctrlssdl when the user picks Exit from the menu.
+void deinit()
 {
-    if (!my_config.cur) return;
-
-	int x = mouse.x;
-	int y = mouse.y;
-
-	x <<= 1;
-
-	DrawCursor(x, y);
+	NDS_DeInit();
+	sceKernelExitGame();
 }
-
 
 static void desmume_cycle()
 {
@@ -172,7 +166,8 @@ static void desmume_cycle()
 		   NDS_setTouchPos(mouse.x, mouse.y);
 	  }
 
-    update_keypad(pad);     /* Update keypad */
+    // Pad state is applied by process_ctrls_event() above (the ported ctrlssdl
+    // calls NDS_applyFinalInputDirect); update_keypad was never defined.
 
   if (my_config.showfps)
       ShowFPS(0,3);
@@ -215,7 +210,10 @@ void EMU_Conf(){
   //ReAddress display to 32bit vram
   pspDebugScreenInitEx((void*)(0x44000000), PSP_DISPLAY_PIXEL_FORMAT_5551, 1);
 
-  DoConfig(&my_config);
+  // Settings are chosen in the new split-screen ROM menu (DSEmuGui) and are
+  // already finalized into my_config there, so the old DoConfig() screen
+  // must not run again -- that is the config page that kept appearing.
+  FinalizeMainSettings(&my_config);
 
   NDS_3D_ChangeCore(my_config.Render3D);
   backup_setManualBackupType(my_config.savetype);
@@ -256,6 +254,7 @@ void ChangeRom(bool reset){
   }
 
   DSEmuGui("",rom_filename);
+  EMU_Conf();   // apply what the menu just chose (the fork does this here)
   pspDebugScreenClear();
 
   int error = NDS_LoadROM(rom_filename);
@@ -324,8 +323,7 @@ int main(int argc, char **argv) {
     my_config.Render3D = true;
     my_config.showfps = true;
   #else
-    ChangeRom(false);
-    EMU_Conf();
+    ChangeRom(false);   // this already runs DSEmuGui + EMU_Conf
   #endif
 
   EMU_SCREEN();

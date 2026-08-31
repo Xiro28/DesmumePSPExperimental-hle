@@ -420,6 +420,7 @@ struct UserInput
 // this is to minimize the risk of desyncs.
 void NDS_setTouchPos(u16 x, u16 y);
 void NDS_releaseTouch(void);
+extern void NDS_applyFinalInputDirect(u16, u16);
 void NDS_setPad(bool right,bool left,bool down,bool up,bool select,bool start,bool B,bool A,bool Y,bool X,bool leftShoulder,bool rightShoulder,bool debug, bool lid);
 void NDS_setMic(bool pressed);
 
