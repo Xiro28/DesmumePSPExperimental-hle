@@ -1896,18 +1896,18 @@ u64 Sequencer::findNext()
 
 void Sequencer::execHardware()
 {
-	if(dispcnt.isTriggered())
+	if (dispcnt.isTriggered())
 	{
 
-//		IF_DEVELOPER(DEBUG_statistics.sequencerExecutionCounters[1]++);
+		//		IF_DEVELOPER(DEBUG_statistics.sequencerExecutionCounters[1]++);
 
-		switch(dispcnt.param)
+		switch (dispcnt.param)
 		{
 		case ESI_DISPCNT_HStart:
 			execHardware_hstart();
 			//(used to be 3168)
-			//hstart is actually 8 dots before the visible drawing begins
-			//we're going to run 1 here and then run 7 in the next case
+			// hstart is actually 8 dots before the visible drawing begins
+			// we're going to run 1 here and then run 7 in the next case
 			dispcnt.timestamp += 12;
 			dispcnt.param = ESI_DISPCNT_HStartIRQ;
 			break;
@@ -1916,12 +1916,12 @@ void Sequencer::execHardware()
 			dispcnt.timestamp += 84;
 			dispcnt.param = ESI_DISPCNT_HDraw;
 			break;
-			
+
 		case ESI_DISPCNT_HDraw:
 			execHardware_hdraw();
-			//duration of non-blanking period is ~1606 clocks (gbatek agrees) [but says its different on arm7]
-			//im gonna call this 267 dots = 267*6=1602
-			//so, this event lasts 267 dots minus the 8 dot preroll
+			// duration of non-blanking period is ~1606 clocks (gbatek agrees) [but says its different on arm7]
+			// im gonna call this 267 dots = 267*6=1602
+			// so, this event lasts 267 dots minus the 8 dot preroll
 			dispcnt.timestamp += 3108;
 			dispcnt.param = ESI_DISPCNT_HBlank;
 			break;
@@ -1929,38 +1929,60 @@ void Sequencer::execHardware()
 		case ESI_DISPCNT_HBlank:
 			execHardware_hblank();
 			//(once this was 1092 or 1092/12=91 dots.)
-			//there are surely 355 dots per scanline, less 267 for non-blanking period. the rest is hblank and then after that is hstart
+			// there are surely 355 dots per scanline, less 267 for non-blanking period. the rest is hblank and then after that is hstart
 			dispcnt.timestamp += 1056;
 			dispcnt.param = ESI_DISPCNT_HStart;
 			break;
 		}
-	}
-	//if (readslot1.isTriggered()) readslot1.exec();
 
-	if (gxfifo.isTriggered()) gxfifo.exec();
+		sequencer.updateEvent<DISP_CNT, true>();
+	}
 
-	if (!math_underclock){
-		if (sqrtunit.isTriggered()) sqrtunit.exec();
-		if (divider.isTriggered()) divider.exec();
-	}	
-		
-#define test(X,Y) if(dma_##X##_##Y .isTriggered()) dma_##X##_##Y .exec();
-	if (!ARM9_SKIP_HACK) {
-		test(0,0); test(0,1); test(0,2); test(0,3);
+	// if (readslot1.isTriggered()) readslot1.exec();
+
+	/*if (gxfifo.isTriggered())
+	{
+		gxfifo.exec();
+		sequencer.removeFromList<GX_FIFO>();
+	}*/
+
+	if (sqrtunit.isTriggered()){
+		sqrtunit.exec();
+		sequencer.removeFromList<SQRT_UNIT>();
 	}
-	if (!ARM7_SKIP_HACK) {
-		test(1, 0) else test(1, 1) else test(1, 2) else test(1, 3);
+
+	if (divider.isTriggered()){
+		divider.exec();
+		sequencer.removeFromList<DIVIDER>();
 	}
+
+
+
+
+#define test(X, Y)                   \
+	if (dma_##X##_##Y.isTriggered()) \
+		dma_##X##_##Y.exec();
+	test(0, 0);
+	test(0, 1);
+	test(0, 2);
+	test(0, 3);
+	test(1, 0);
+	test(1, 1);
+	test(1, 2);
+	test(1, 3);
 #undef test
-#define test(X,Y) if(timer_##X##_##Y .enabled) if(timer_##X##_##Y .isTriggered()) timer_##X##_##Y .exec();
-	if (!ARM9_SKIP_HACK) {
-		test(0,0); test(0,1); test(0,2); test(0,3);
-	}
-	if (!ARM7_SKIP_HACK) {
-		test(1, 0); test(1, 1); test(1, 2); test(1, 3);
-	}
+#define test(X, Y)                     \
+	if (timer_##X##_##Y.isTriggered()) \
+		timer_##X##_##Y.exec();
+	test(0, 0);
+	test(0, 1);
+	test(0, 2);
+	test(0, 3);
+	test(1, 0);
+	test(1, 1);
+	test(1, 2);
+	test(1, 3);
 #undef test
-
 }
 
 void execHardware_interrupts();
