@@ -1541,13 +1541,24 @@ void NDS_RescheduleTimers()
 	check(1,0); check(1,1); check(1,2); check(1,3);
 #undef check
 
-	NDS_ReschedulePtr = true;
+	// schedule() only moves the timestamp. With the ordered-list sequencer the
+	// event also has to be re-queued, or it never fires again.
+#define requeue(X,Y,ID) if (sequencer.timer_##X##_##Y .enabled) sequencer.updateEvent<ID, false>();
+	requeue(0,0,TIMER_00); requeue(0,1,TIMER_01); requeue(0,2,TIMER_02); requeue(0,3,TIMER_03);
+	requeue(1,0,TIMER_10); requeue(1,1,TIMER_11); requeue(1,2,TIMER_12); requeue(1,3,TIMER_13);
+#undef requeue
+
+	NDS_ReschedulePtr = 1;
 }
 
 void NDS_RescheduleDMA()
 {
-	//TBD
-	NDS_ReschedulePtr = true;
+#define requeue(X,Y,ID) if (sequencer.dma_##X##_##Y .isEnabled()) sequencer.updateEvent<ID, false>();
+	requeue(0,0,DMA_00); requeue(0,1,DMA_01); requeue(0,2,DMA_02); requeue(0,3,DMA_03);
+	requeue(1,0,DMA_10); requeue(1,1,DMA_11); requeue(1,2,DMA_12); requeue(1,3,DMA_13);
+#undef requeue
+
+	NDS_ReschedulePtr = 1;
 }
 
 
