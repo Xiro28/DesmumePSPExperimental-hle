@@ -1654,6 +1654,10 @@ bool nds_loadstate(EMUFILE* is, int size)
 }
 
 //these have not been tuned very well yet.
+// Set to false to run both CPUs through the interpreter (much slower, but it
+// takes the JIT out of the picture when chasing a hang).
+#define NDS_USE_JIT false
+
 static const int kMaxWork = 4000;
 static const int kIrqWait = 4000;
 
@@ -1772,7 +1776,7 @@ void NDS_exec(s32 nb)
 		s32 arm7 = (s32)(nds_arm7_timer-nds_timer);
 		s32 s32next = (s32)(next-nds_timer);
 
-		u32 arm9arm7 = armInnerLoop<true,true,true>(nds_timer_base,s32next,arm9,arm7);
+		u32 arm9arm7 = armInnerLoop<true,true,NDS_USE_JIT>(nds_timer_base,s32next,arm9,arm7);
 
 		//ARM7_SKIP_HACK = nds.hw_status.VCount < 180 || (my_config.extrmarm7down && nds.hw_status.VCount > 230);
 		//ARM7_SKIP_HACK = (nds.hw_status.VCount > 230 && ipc_fifo[ARM7].size > 0) || nds.hw_status.VCount < 185;
