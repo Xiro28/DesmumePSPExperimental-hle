@@ -1530,8 +1530,9 @@ void NDS_RescheduleGXFIFO(u32 cost)
 		sequencer.gxfifo.enabled = true;
 	}
 	MMU.gfx3dCycles += cost;
-	
-	NDS_ReschedulePtr = true;
+
+	// The fork deliberately does not reschedule here -- doing so on every GX
+	// command keeps tearing exec_cpu out of its run loop.
 }
 
 void NDS_RescheduleTimers()
@@ -2165,17 +2166,13 @@ void exec_cpu()
 	// to answer while the ARM7 waits.
 	s32 timer = std::min(arm9, arm7);
 
-	// popNext() returns the head event's distance from nds_timer. If that is
-	// already <= timer the event is due, but execHardware only fires on
-	// nds_timer >= timestamp -- so with both at 0 nothing ran and nothing
-	// advanced: the loop spun forever. Step time forward by at least one
-	// cycle so the event becomes reachable.
-	if (s32next <= timer)
-		s32next = timer + 1;
-
-	while (timer < s32next && NDS_ReschedulePtr == 0)
+	// Run until the ARM9 reaches the next event, as upstream and the fork both do.
+	// Gating on min(arm9, arm7) ended the loop as soon as the ARM7 fell behind,
+	// which is what the old 's32next = timer + 1' patch was papering over -- it
+	// made time crawl one cycle per iteration.
+	while (arm9 < s32next && NDS_ReschedulePtr == 0)
 	{
-		if (arm9 <= timer)
+		if (arm9 <= timer)   // ARM9 is the one behind
 		{
 #if PROFILER_ENABLED
 			g_prof_a9_calls++;
@@ -2196,7 +2193,7 @@ void exec_cpu()
 			}
 		}
 
-		if (arm7 <= timer)
+		if (arm7 <= timer)   // ARM7 is behind: give it a turn
 		{
 			const bool frozen =
 				!!(NDS_ARM7.freeze & (CPU_FREEZE_WAIT_IRQ | CPU_FREEZE_OVERCLOCK_HACK));

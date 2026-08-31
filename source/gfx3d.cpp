@@ -259,8 +259,11 @@ public:
 // updates the GX timing differently. This tree still has the upstream
 // scheduler, where 42 call sites rely on GFX_DELAY to charge FIFO time -- with
 // them empty a game that waits on the GX FIFO never sees it drain.
-#define GFX_DELAY(x) NDS_RescheduleGXFIFO(1);
-#define GFX_DELAY_M2(x) NDS_RescheduleGXFIFO(1);
+// Left empty as in the -hle tree: its sequencer accounts for GX timing itself,
+// and charging it here forces a reschedule on all 42 call sites, which kicks
+// exec_cpu out of its loop constantly.
+#define GFX_DELAY(x) {}
+#define GFX_DELAY_M2(x) {}
 
 // baseline signature is NDS_RescheduleGXFIFO(u32 cost) -- the fork's second
 // 'update' argument came with its new sequencer, which is not ported yet.
