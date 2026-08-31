@@ -605,6 +605,7 @@ static inline void MMU_VRAMmapRefreshBank()
 			case 3: //texture
 				vramConfiguration.banks[bank].purpose = VramConfiguration::TEX;
 				MMU.texInfo.textureSlotAddr[ofs] = MMU_vram_physical(vram_bank_info[bank].page_addr);
+				gpu3D->NDS_3D_VramReconfigureSignal();
 				break;
 			default: goto unsupported_mst;
 			}
@@ -643,6 +644,7 @@ static inline void MMU_VRAMmapRefreshBank()
 			case 3: //texture
 				vramConfiguration.banks[bank].purpose = VramConfiguration::TEX;
 				MMU.texInfo.textureSlotAddr[ofs] = MMU_vram_physical(vram_bank_info[bank].page_addr);
+				gpu3D->NDS_3D_VramReconfigureSignal();
 				break;
 			case 4: //BGB or BOBJ
 				if(bank == VRAM_BANK_C)  {
@@ -680,6 +682,7 @@ static inline void MMU_VRAMmapRefreshBank()
 				MMU.texInfo.texPalSlot[1] = MMU_vram_physical(vram_bank_info[bank].page_addr+1);
 				MMU.texInfo.texPalSlot[2] = MMU_vram_physical(vram_bank_info[bank].page_addr+2);
 				MMU.texInfo.texPalSlot[3] = MMU_vram_physical(vram_bank_info[bank].page_addr+3);
+				gpu3D->NDS_3D_VramReconfigureSignal();
 				break;
 			case 4: //A BG extended palette
 				vramConfiguration.banks[bank].purpose = VramConfiguration::ABGEXTPAL;
@@ -718,6 +721,7 @@ static inline void MMU_VRAMmapRefreshBank()
 			case 3: //texture palette
 				vramConfiguration.banks[bank].purpose = VramConfiguration::TEXPAL;
 				MMU.texInfo.texPalSlot[pageofs] = MMU_vram_physical(vram_bank_info[bank].page_addr);
+				gpu3D->NDS_3D_VramReconfigureSignal();
 				break;
 			case 4: //A BG extended palette
 				switch(ofs) {
