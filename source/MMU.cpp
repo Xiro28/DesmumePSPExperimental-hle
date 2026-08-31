@@ -1160,7 +1160,7 @@ void SetupMMU(bool debugConsole, bool dsi) {
 
 std::map<u64, u32> cached_sqrt;
 
-static void execsqrt() {
+void execsqrt() {   // not static: the sequencer calls it
 	u32 ret;
 	const u8 mode = MMU_new.sqrt.mode;
 	MMU_new.sqrt.busy = 1;
@@ -1233,7 +1233,7 @@ char* mystrcat(char* dest, char* src)
 	return --dest;
 }*/
 
-static void execdiv() {
+void execdiv() {   // not static: the sequencer calls it
 
 	s64 num,den;
 	s64 res,mod;

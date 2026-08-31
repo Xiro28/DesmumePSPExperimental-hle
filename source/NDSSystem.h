@@ -418,6 +418,10 @@ struct UserInput
 // these functions merely request the input to be changed.
 // the actual change happens later at a specific time during the frame.
 // this is to minimize the risk of desyncs.
+// Scratchpad flag the generated MIPS loop polls, as in the -hle tree.
+#define NDS_ReschedulePtr (*(bool*)(0x0010080))
+#define SCRATCHPAD_ADDR				0x00010000		/* Physical */
+
 void NDS_setTouchPosDirect(u16 x, u16 y);
 void NDS_releaseTouchDirect(void);
 void NDS_setTouchPos(u16 x, u16 y);

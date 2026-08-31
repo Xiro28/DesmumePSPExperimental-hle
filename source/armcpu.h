@@ -293,6 +293,7 @@ struct armcpu_t
 	u32 R8_fiq, R9_fiq, R10_fiq, R11_fiq, R12_fiq, R13_fiq, R14_fiq;
 	Status_Reg SPSR_svc, SPSR_abt, SPSR_und, SPSR_irq, SPSR_fiq;
 
+	bool idle_loop;   // set by the JIT when a block is a pure spin
 	u32 intVector;
 	u8 LDTBit;  //1 : ARMv5 style 0 : non ARMv5 (earlier)
 	

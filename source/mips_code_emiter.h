@@ -3,6 +3,7 @@
 
 #include "types.h"
 #include "PSP/emit/psp_emit.h"
+#include <cstdio>
 
 //THE EMITER IS TAKEN FROM NULLDC PSP
 //CODE FROM Hlide AND Skmpt
@@ -30,7 +31,10 @@ u32  emit_SlideDelay();
 
 void make_address_range_executable(u32 address_start, u32 address_end);
 
+void initCodeCache();
 void resetCodeCache();
+
+void  set_code_cache(u8* cache);
 
 void* emit_GetPtr();
 u32   emit_getPointAdr();

@@ -18,6 +18,7 @@
 
 #include "PSP/pspDmac.h"
 #include "NDSSystem.h"
+#include "mips_code_emiter.h"
 
 #include <string.h>
 #include <stdlib.h>
@@ -826,24 +827,54 @@ u64 nds_arm9_timer, nds_arm7_timer;
 
 static const u64 kNever = 0xFFFFFFFFFFFFFFFFULL;
 
+#define REGISTER_BASIC_EVENT(ID, TYPE) \
+	registerEvent(ID, &TYPE, \
+		[](void* instance) { \
+			return static_cast<TSequenceItem*>(instance)->enabled; \
+		}, \
+		[](void* instance) { \
+			return static_cast<TSequenceItem*>(instance)->next(); \
+		});
+
+#define REGISTER_DMA_EVENT(P, C) \
+	registerEvent(static_cast<EventID>(DMA_00 + P * 4 + C), &dma_##P##_##C, \
+		[](void* instance) { \
+			return static_cast<TSequenceItem_DMA<P, C>*>(instance)->isEnabled(); \
+		}, \
+		[](void* instance) { \
+			return static_cast<TSequenceItem_DMA<P, C>*>(instance)->next(); \
+		});
+
+#define REGISTER_TIMER_EVENT(P, C) \
+	registerEvent(static_cast<EventID>(TIMER_00 + P * 4 + C), &timer_##P##_##C, \
+		[](void* instance) { \
+			return static_cast<TSequenceItem_Timer<P, C>*>(instance)->enabled; \
+		}, \
+		[](void* instance) { \
+			return static_cast<TSequenceItem_Timer<P, C>*>(instance)->next(); \
+		});	
+
 struct TSequenceItem
 {
 	u64 timestamp;
 	u32 param;
 	bool enabled;
 
-	virtual void save(EMUFILE* os)
+	virtual void save(EMUFILE *os)
 	{
-		write64le(timestamp,os);
-		write32le(param,os);
-		writebool(enabled,os);
+		write64le(timestamp, os);
+		write32le(param, os);
+		writebool(enabled, os);
 	}
 
-	virtual bool load(EMUFILE* is)
+	virtual bool load(EMUFILE *is)
 	{
-		if(read64le(&timestamp,is) != 1) return false;
-		if(read32le(&param,is) != 1) return false;
-		if(readbool(&enabled,is) != 1) return false;
+		if (read64le(&timestamp, is) != 1)
+			return false;
+		if (read32le(&param, is) != 1)
+			return false;
+		if (readbool(&enabled, is) != 1)
+			return false;
 		return true;
 	}
 
@@ -858,6 +889,7 @@ struct TSequenceItem
 	}
 };
 
+
 struct TSequenceItem_GXFIFO : public TSequenceItem
 {
 	FORCEINLINE bool isTriggered()
@@ -867,8 +899,9 @@ struct TSequenceItem_GXFIFO : public TSequenceItem
 
 	FORCEINLINE void exec()
 	{
-//		IF_DEVELOPER(DEBUG_statistics.sequencerExecutionCounters[4]++);
-		while(isTriggered()) {
+		//		IF_DEVELOPER(DEBUG_statistics.sequencerExecutionCounters[4]++);
+		//while (isTriggered())
+		{
 			enabled = false;
 			gfx3d_execute3D();
 		}
@@ -876,12 +909,15 @@ struct TSequenceItem_GXFIFO : public TSequenceItem
 
 	FORCEINLINE u64 next()
 	{
-		if(enabled) return MMU.gfx3dCycles;
-		else return kNever;
+		if (enabled)
+			return MMU.gfx3dCycles;
+		else
+			return kNever;
 	}
 };
 
-template<int procnum, int num> struct TSequenceItem_Timer : public TSequenceItem
+template <int procnum, int num>
+struct TSequenceItem_Timer : public TSequenceItem
 {
 	FORCEINLINE bool isTriggered()
 	{
@@ -900,60 +936,65 @@ template<int procnum, int num> struct TSequenceItem_Timer : public TSequenceItem
 
 	FORCEINLINE void exec()
 	{
-//		IF_DEVELOPER(DEBUG_statistics.sequencerExecutionCounters[13+procnum*4+num]++);
-		u8* regs = procnum==0?MMU.ARM9_REG:MMU.ARM7_REG;
+		//		IF_DEVELOPER(DEBUG_statistics.sequencerExecutionCounters[13+procnum*4+num]++);
+		u8 *regs = MMU.ARM9_REG;
 		bool first = true;
-		//we'll need to check chained timers..
-		for(int i=num;i<4;i++)
+		// we'll need to check chained timers..
+		for (int i = num; i < 4; i++)
 		{
 			bool over = false;
-			//maybe too many checks if this is here, but we need it here for now
-			if(!MMU.timerON[procnum][i]) return;
+			// maybe too many checks if this is here, but we need it here for now
+			if (!MMU.timerON[procnum][i])
+				return;
 
-			if(MMU.timerMODE[procnum][i] == 0xFFFF)
+			if (MMU.timerMODE[procnum][i] == 0xFFFF)
 			{
 				++(MMU.timer[procnum][i]);
 				over = !MMU.timer[procnum][i];
 			}
 			else
 			{
-				if(!first) break; //this timer isn't chained. break the chain
+				if (!first)
+					break; // this timer isn't chained. break the chain
 				first = false;
 
 				over = true;
 				int remain = 65536 - MMU.timerReload[procnum][i];
-				int ctr=0;
-				while(nds.timerCycle[procnum][i] <= nds_timer) {
+				int ctr = 0;
+				while (nds.timerCycle[procnum][i] <= nds_timer)
+				{
 					nds.timerCycle[procnum][i] += (remain << MMU.timerMODE[procnum][i]);
 					ctr++;
 				}
 			}
 
-			if(over)
+			if (over)
 			{
 				MMU.timer[procnum][i] = MMU.timerReload[procnum][i];
-				if(T1ReadWord(regs, 0x102 + i*4) & 0x40) 
+				if (T1ReadWord(regs, 0x102 + i * 4) & 0x40)
 				{
 					NDS_makeIrq(procnum, IRQ_BIT_TIMER_0 + i);
 				}
 			}
 			else
-				break; //no more chained timers to trigger. we're done here
+				break; // no more chained timers to trigger. we're done here
 		}
 	}
 };
 
-template<int procnum, int chan> struct TSequenceItem_DMA : public TSequenceItem
+template <int procnum, int chan>
+struct TSequenceItem_DMA : public TSequenceItem
 {
-	DmaController* controller;
+	DmaController *controller;
 
 	FORCEINLINE bool isTriggered()
 	{
-		return (controller->dmaCheck && nds_timer>= controller->nextEvent);
+		return (controller->dmaCheck && nds_timer >= controller->nextEvent);
 	}
 
-	FORCEINLINE bool isEnabled() { 
-		return controller->dmaCheck?TRUE:FALSE;
+	FORCEINLINE bool isEnabled()
+	{
+		return controller->dmaCheck ? TRUE : FALSE;
 	}
 
 	FORCEINLINE u64 next()
@@ -963,49 +1004,48 @@ template<int procnum, int chan> struct TSequenceItem_DMA : public TSequenceItem
 
 	FORCEINLINE void exec()
 	{
-//		IF_DEVELOPER(DEBUG_statistics.sequencerExecutionCounters[5+procnum*4+chan]++);
+		//		IF_DEVELOPER(DEBUG_statistics.sequencerExecutionCounters[5+procnum*4+chan]++);
 
-		//if (nds.freezeBus) return;
-	
-		//printf("exec from TSequenceItem_DMA: %d %d\n",procnum,chan);
+		// if (nds.freezeBus) return;
+
+		// printf("exec from TSequenceItem_DMA: %d %d\n",procnum,chan);
 		/*if (controller->startmode == EDMAMode_GXFifo) {
 			SDE_PROFILE(pf, controller->exec(), "DMA GFX");
 			pf.outputStats("dma.txt");
 		}
 		else*/
-			controller->exec();
+		controller->exec();
 
-//		//give gxfifo dmas a chance to re-trigger
-//		if(MMU.DMAStartTime[procnum][chan] == EDMAMode_GXFifo) {
-//			MMU.DMAing[procnum][chan] = FALSE;
-//			if (gxFIFO.size <= 127) 
-//			{
-//				execHardware_doDma(procnum,chan,EDMAMode_GXFifo);
-//				if (MMU.DMACompleted[procnum][chan])
-//					goto docomplete;
-//				else return;
-//			}
-//		}
-//
-//docomplete:
-//		if (MMU.DMACompleted[procnum][chan])	
-//		{
-//			u8* regs = procnum==0?MMU.ARM9_REG:MMU.ARM7_REG;
-//
-//			//disable the channel
-//			if(MMU.DMAStartTime[procnum][chan] != EDMAMode_GXFifo) {
-//				T1WriteLong(regs, 0xB8 + (0xC*chan), T1ReadLong(regs, 0xB8 + (0xC*chan)) & 0x7FFFFFFF);
-//				MMU.DMACrt[procnum][chan] &= 0x7FFFFFFF; //blehhh i hate this shit being mirrored in memory
-//			}
-//
-//			if((MMU.DMACrt[procnum][chan])&(1<<30)) {
-//				if(procnum==0) NDS_makeARM9Int(8+chan);
-//				else NDS_makeARM7Int(8+chan);
-//			}
-//
-//			MMU.DMAing[procnum][chan] = FALSE;
-//		}
-
+		//		//give gxfifo dmas a chance to re-trigger
+		//		if(MMU.DMAStartTime[procnum][chan] == EDMAMode_GXFifo) {
+		//			MMU.DMAing[procnum][chan] = FALSE;
+		//			if (gxFIFO.size <= 127)
+		//			{
+		//				execHardware_doDma(procnum,chan,EDMAMode_GXFifo);
+		//				if (MMU.DMACompleted[procnum][chan])
+		//					goto docomplete;
+		//				else return;
+		//			}
+		//		}
+		//
+		// docomplete:
+		//		if (MMU.DMACompleted[procnum][chan])
+		//		{
+		//			u8* regs = procnum==0?MMU.ARM9_REG:MMU.ARM7_REG;
+		//
+		//			//disable the channel
+		//			if(MMU.DMAStartTime[procnum][chan] != EDMAMode_GXFifo) {
+		//				T1WriteLong(regs, 0xB8 + (0xC*chan), T1ReadLong(regs, 0xB8 + (0xC*chan)) & 0x7FFFFFFF);
+		//				MMU.DMACrt[procnum][chan] &= 0x7FFFFFFF; //blehhh i hate this shit being mirrored in memory
+		//			}
+		//
+		//			if((MMU.DMACrt[procnum][chan])&(1<<30)) {
+		//				if(procnum==0) NDS_makeARM9Int(8+chan);
+		//				else NDS_makeARM7Int(8+chan);
+		//			}
+		//
+		//			MMU.DMAing[procnum][chan] = FALSE;
+		//		}
 	}
 };
 
@@ -1016,7 +1056,7 @@ struct TSequenceItem_divider : public TSequenceItem
 		return MMU.divRunning && nds_timer >= MMU.divCycles;
 	}
 
-	bool isEnabled() { return MMU.divRunning!=0; }
+	bool isEnabled() { return MMU.divRunning != 0; }
 
 	FORCEINLINE u64 next()
 	{
@@ -1025,9 +1065,13 @@ struct TSequenceItem_divider : public TSequenceItem
 
 	void exec()
 	{
-//		IF_DEVELOPER(DEBUG_statistics.sequencerExecutionCounters[2]++);
+		//		IF_DEVELOPER(DEBUG_statistics.sequencerExecutionCounters[2]++);
+		extern void execdiv();
+
+		execdiv();
+
 		MMU_new.div.busy = 0;
-#ifdef HOST_64 
+#ifdef HOST_64
 		T1WriteQuad(MMU.MMU_MEM[ARMCPU_ARM9][0x40], 0x2A0, MMU.divResult);
 		T1WriteQuad(MMU.MMU_MEM[ARMCPU_ARM9][0x40], 0x2A8, MMU.divMod);
 #else
@@ -1038,7 +1082,6 @@ struct TSequenceItem_divider : public TSequenceItem
 #endif
 		MMU.divRunning = FALSE;
 	}
-
 };
 
 struct TSequenceItem_sqrtunit : public TSequenceItem
@@ -1048,7 +1091,7 @@ struct TSequenceItem_sqrtunit : public TSequenceItem
 		return MMU.sqrtRunning && nds_timer >= MMU.sqrtCycles;
 	}
 
-	bool isEnabled() { return MMU.sqrtRunning!=0; }
+	bool isEnabled() { return MMU.sqrtRunning != 0; }
 
 	FORCEINLINE u64 next()
 	{
@@ -1057,12 +1100,37 @@ struct TSequenceItem_sqrtunit : public TSequenceItem
 
 	FORCEINLINE void exec()
 	{
-//		IF_DEVELOPER(DEBUG_statistics.sequencerExecutionCounters[3]++);
+		//		IF_DEVELOPER(DEBUG_statistics.sequencerExecutionCounters[3]++);
+		extern void execsqrt();
+
+		execsqrt();
+
 		MMU_new.sqrt.busy = 0;
 		T1WriteLong(MMU.MMU_MEM[ARMCPU_ARM9][0x40], 0x2B4, MMU.sqrtResult);
 		MMU.sqrtRunning = FALSE;
 	}
+};
 
+struct TSequenceItem_WiFi : public TSequenceItem
+{
+	FORCEINLINE bool isTriggered()
+	{
+		return enabled && nds_timer >= timestamp;
+	}
+
+	bool isEnabled() { return this->enabled; }
+
+	FORCEINLINE u64 next()
+	{
+		return timestamp;
+	}
+
+	void exec()
+	{
+		extern void wifi_scan_callback();
+		enabled = false;
+		wifi_scan_callback();
+	}
 };
 
 struct TSequenceItem_ReadSlot1 : public TSequenceItem
@@ -1088,66 +1156,341 @@ struct TSequenceItem_ReadSlot1 : public TSequenceItem
 		T1WriteLong(MMU.MMU_MEM[procnum][0x40], 0x1A4, val);
 		triggerDma(EDMAMode_Card);
 	}
+};
 
+enum EventID
+{
+	DISP_CNT,
+	DIVIDER,
+	SQRT_UNIT,
+	GX_FIFO,
+	WIFI_EXP, // EXPERIMENTAL_WIFI_COMM
+	// DMA channels
+	DMA_00,
+	DMA_01,
+	DMA_02,
+	DMA_03,
+	DMA_10,
+	DMA_11,
+	DMA_12,
+	DMA_13,
+	// Timer channels
+	TIMER_00,
+	TIMER_01,
+	TIMER_02,
+	TIMER_03,
+	TIMER_10,
+	TIMER_11,
+	TIMER_12,
+	TIMER_13,
+	EVENT_COUNT
 };
 
 struct Sequencer
 {
 	bool nds_vblankEnded;
-	bool reschedule;
+
 	TSequenceItem dispcnt;
 	TSequenceItem wifi;
 	TSequenceItem_divider divider;
 	TSequenceItem_sqrtunit sqrtunit;
 	TSequenceItem_GXFIFO gxfifo;
-	//TSequenceItem_ReadSlot1 readslot1;
-	TSequenceItem_DMA<0,0> dma_0_0; TSequenceItem_DMA<0,1> dma_0_1; 
-	TSequenceItem_DMA<0,2> dma_0_2; TSequenceItem_DMA<0,3> dma_0_3; 
-	TSequenceItem_DMA<1,0> dma_1_0; TSequenceItem_DMA<1,1> dma_1_1; 
-	TSequenceItem_DMA<1,2> dma_1_2; TSequenceItem_DMA<1,3> dma_1_3; 
-	TSequenceItem_Timer<0,0> timer_0_0; TSequenceItem_Timer<0,1> timer_0_1;
-	TSequenceItem_Timer<0,2> timer_0_2; TSequenceItem_Timer<0,3> timer_0_3;
-	TSequenceItem_Timer<1,0> timer_1_0; TSequenceItem_Timer<1,1> timer_1_1;
-	TSequenceItem_Timer<1,2> timer_1_2; TSequenceItem_Timer<1,3> timer_1_3;
+	TSequenceItem_ReadSlot1 readslot1;
+	TSequenceItem_DMA<0, 0> dma_0_0;
+	TSequenceItem_DMA<0, 1> dma_0_1;
+	TSequenceItem_DMA<0, 2> dma_0_2;
+	TSequenceItem_DMA<0, 3> dma_0_3;
+	TSequenceItem_DMA<1, 0> dma_1_0;
+	TSequenceItem_DMA<1, 1> dma_1_1;
+	TSequenceItem_DMA<1, 2> dma_1_2;
+	TSequenceItem_DMA<1, 3> dma_1_3;
+	TSequenceItem_Timer<0, 0> timer_0_0;
+	TSequenceItem_Timer<0, 1> timer_0_1;
+	TSequenceItem_Timer<0, 2> timer_0_2;
+	TSequenceItem_Timer<0, 3> timer_0_3;
+	TSequenceItem_Timer<1, 0> timer_1_0;
+	TSequenceItem_Timer<1, 1> timer_1_1;
+	TSequenceItem_Timer<1, 2> timer_1_2;
+	TSequenceItem_Timer<1, 3> timer_1_3;
+
+	// Definiamo i tipi di puntatori a funzione per le callback
+    // Usiamo void* per passare l'istanza del componente (es. &timer0)
+    using CheckFunc = bool (*)(void* instance);
+    using NextFunc = u64 (*)(void* instance);
+
+    struct EventHandler {
+        void* instance;      // Puntatore all'oggetto (es. &divider)
+        CheckFunc isEnabled; // Puntatore alla funzione statica wrapper
+        NextFunc computeNext;
+    };
+
+    struct EventNode {
+        s32 next_time; // 4 byte
+        s32 next;      // 4 byte
+        s32 prev;      // 4 byte
+        s32 pending;   // 4 byte (usiamo s32 invece di bool per allineamento perfetto)
+    };
+
+    // Allocazione statica contigua
+    EventNode nodes[EVENT_COUNT];
+    EventHandler handlers[EVENT_COUNT];
+    s32 head;
+
+	void registerEvent(int id, void* instance, CheckFunc check, NextFunc next) {
+        handlers[id].instance = instance;
+        handlers[id].isEnabled = check;
+        handlers[id].computeNext = next;
+    }
+
+    void removeFromList(int idx) {
+        EventNode& n = nodes[idx]; // Riferimento per leggibilità
+        s32 p = n.prev;
+        s32 nxt = n.next; // 'next' è parola riservata a volte, usiamo nxt
+
+        if (p != -1) nodes[p].next = nxt;
+        if (nxt != -1) nodes[nxt].prev = p;
+        if (head == idx) head = nxt;
+
+        n.prev = -1;
+        n.next = -1;
+    }
+
+	template <EventID idx>
+	void removeFromList() {
+        removeFromList(static_cast<int>(idx));
+    }
+
+    void insertSorted(int idx) {
+        s32 time = nodes[idx].next_time;
+
+        // Fast path: Inserimento in testa
+        if (head == -1 || time < nodes[head].next_time) {
+            nodes[idx].next = head;
+            nodes[idx].prev = -1;
+            if (head != -1) nodes[head].prev = idx;
+            head = idx;
+            return;
+        }
+
+        // Linear search (Cache friendly grazie al layout EventNode)
+        s32 curr = head;
+        while (true) {
+            s32 nxt = nodes[curr].next;
+            if (nxt == -1 || nodes[nxt].next_time > time) break;
+            curr = nxt;
+        }
+
+        // Inserimento
+        s32 nxt = nodes[curr].next;
+        nodes[curr].next = idx;
+        nodes[idx].prev = curr;
+        nodes[idx].next = nxt;
+        if (nxt != -1) nodes[nxt].prev = idx;
+    }
+
+	bool isEnabled(EventID id)
+	{
+		return handlers[id].isEnabled(handlers[id].instance);
+	}
+
+	template <EventID id>
+	s32 computeNext()
+	{
+		return handlers[id].computeNext(handlers[id].instance) - nds_timer;
+	}
+
+	s32 computeNext(EventID id)
+	{
+		return handlers[id].computeNext(handlers[id].instance) - nds_timer;
+	}
+
+    void reSchedule() {
+        head = -1;
+        for (int i = 0; i < EVENT_COUNT; ++i) {
+
+			EventID eventId = static_cast<EventID>(i);
+
+            nodes[i].prev = -1;
+            nodes[i].next = -1;
+
+            if (isEnabled(eventId)) {
+                nodes[i].next_time = computeNext(eventId);
+                insertSorted(eventId);
+            } else {
+                nodes[i].next_time = kNever;
+            }
+        }
+    }
+
+	void resolve_pendings() {
+        for (int i = 0; i < EVENT_COUNT; ++i) {
+			EventID eventId = static_cast<EventID>(i);
+            // Check veloce su intero (pending) prima di chiamare la funzione virtuale/pointer
+            if (nodes[i].pending) {
+                if (isEnabled(eventId)) {
+                    nodes[i].pending = 0;
+                    insertSorted(eventId);
+                }
+            }
+        }
+    }
+
+
+	void updateEventCycle(EventID id, u32 cycles) {
+        int idx = static_cast<int>(id);
+        nodes[id].next_time -= cycles;
+    }
+
+	template <EventID id>
+	void addToEvent(u32 cycles) {
+		constexpr int idx = static_cast<int>(id);
+        nodes[idx].next_time += cycles;
+        nodes[idx].pending = true;
+	}
+
+	template <EventID id, bool direct>
+    void updateEvent() {
+        // Verifica rapida se il nodo è già linkato
+        if (nodes[id].prev != -1 || nodes[id].next != -1 || head == id) {
+            removeFromList(id);
+        }
+
+        if (!isEnabled(id)) return;
+
+        nodes[id].next_time = computeNext(id);
+
+        if (direct) {
+            insertSorted(id);
+        } else {
+            nodes[id].pending = 1;
+        }
+    }
+
+
+    s32 popNext(EventID &outEvent) {
+		s32 currentHead = head;
+        if (currentHead == -1) {
+            // Gestione lista vuota
+            return kNever; 
+        }
+
+        return nodes[currentHead].next_time;
+    }
+
+	Sequencer() : head(-1) {
+        for (int i = 0; i < EVENT_COUNT; ++i) {
+            nodes[i].next = -1;
+            nodes[i].prev = -1;
+            nodes[i].next_time = kNever;
+            nodes[i].pending = 0;
+            
+            // Default handlers sicuri (evitano crash se dimentichi di registrarli)
+            handlers[i].instance = nullptr;
+            handlers[i].isEnabled = [](void*) { return false; };
+            handlers[i].computeNext = [](void*) { return kNever; };
+        }
+
+		REGISTER_DMA_EVENT(0, 0);
+		REGISTER_DMA_EVENT(0, 1);
+		REGISTER_DMA_EVENT(0, 2);
+		REGISTER_DMA_EVENT(0, 3);
+
+		REGISTER_TIMER_EVENT(0, 0);
+		REGISTER_TIMER_EVENT(0, 1);
+		REGISTER_TIMER_EVENT(0, 2);
+		REGISTER_TIMER_EVENT(0, 3);
+
+		// ARM7 DMA/timer events. The EventID slots exist but the fork never
+		// registered them -- it runs the ARM7 under HLE. The real core waits on
+		// its timers for IRQs, so without these it never makes progress.
+		REGISTER_DMA_EVENT(1, 0);
+		REGISTER_DMA_EVENT(1, 1);
+		REGISTER_DMA_EVENT(1, 2);
+		REGISTER_DMA_EVENT(1, 3);
+
+		REGISTER_TIMER_EVENT(1, 0);
+		REGISTER_TIMER_EVENT(1, 1);
+		REGISTER_TIMER_EVENT(1, 2);
+		REGISTER_TIMER_EVENT(1, 3);
+
+		REGISTER_BASIC_EVENT(DISP_CNT, dispcnt);
+		REGISTER_BASIC_EVENT(DIVIDER, divider);
+		REGISTER_BASIC_EVENT(SQRT_UNIT, sqrtunit);
+	}
 
 	void init();
 
 	void execHardware();
 	u64 findNext();
 
-	void save(EMUFILE* os)
+	void save(EMUFILE *os)
 	{
-		write64le(nds_timer,os);
-		write64le(nds_arm9_timer,os);
-		write64le(nds_arm7_timer,os);
+		write64le(nds_timer, os);
+		write64le(nds_arm9_timer, os);
+		write64le(nds_arm7_timer, os);
 		dispcnt.save(os);
 		divider.save(os);
 		sqrtunit.save(os);
-		gxfifo.save(os);
+		//gxfifo.save(os);
 		wifi.save(os);
-#define SAVE(I,X,Y) I##_##X##_##Y .save(os);
-		SAVE(timer,0,0); SAVE(timer,0,1); SAVE(timer,0,2); SAVE(timer,0,3); 
-		SAVE(timer,1,0); SAVE(timer,1,1); SAVE(timer,1,2); SAVE(timer,1,3); 
-		SAVE(dma,0,0); SAVE(dma,0,1); SAVE(dma,0,2); SAVE(dma,0,3); 
-		SAVE(dma,1,0); SAVE(dma,1,1); SAVE(dma,1,2); SAVE(dma,1,3); 
+#define SAVE(I, X, Y) I##_##X##_##Y.save(os);
+		SAVE(timer, 0, 0);
+		SAVE(timer, 0, 1);
+		SAVE(timer, 0, 2);
+		SAVE(timer, 0, 3);
+		SAVE(timer, 1, 0);
+		SAVE(timer, 1, 1);
+		SAVE(timer, 1, 2);
+		SAVE(timer, 1, 3);
+		SAVE(dma, 0, 0);
+		SAVE(dma, 0, 1);
+		SAVE(dma, 0, 2);
+		SAVE(dma, 0, 3);
+		SAVE(dma, 1, 0);
+		SAVE(dma, 1, 1);
+		SAVE(dma, 1, 2);
+		SAVE(dma, 1, 3);
 #undef SAVE
 	}
 
-	bool load(EMUFILE* is, int version)
+	bool load(EMUFILE *is, int version)
 	{
-		if(read64le(&nds_timer,is) != 1) return false;
-		if(read64le(&nds_arm9_timer,is) != 1) return false;
-		if(read64le(&nds_arm7_timer,is) != 1) return false;
-		if(!dispcnt.load(is)) return false;
-		if(!divider.load(is)) return false;
-		if(!sqrtunit.load(is)) return false;
-		if(!gxfifo.load(is)) return false;
-		if(version >= 1) if(!wifi.load(is)) return false;
-#define LOAD(I,X,Y) if(!I##_##X##_##Y .load(is)) return false;
-		LOAD(timer,0,0); LOAD(timer,0,1); LOAD(timer,0,2); LOAD(timer,0,3); 
-		LOAD(timer,1,0); LOAD(timer,1,1); LOAD(timer,1,2); LOAD(timer,1,3); 
-		LOAD(dma,0,0); LOAD(dma,0,1); LOAD(dma,0,2); LOAD(dma,0,3); 
-		LOAD(dma,1,0); LOAD(dma,1,1); LOAD(dma,1,2); LOAD(dma,1,3); 
+		if (read64le(&nds_timer, is) != 1)
+			return false;
+		if (read64le(&nds_arm9_timer, is) != 1)
+			return false;
+		if (read64le(&nds_arm7_timer, is) != 1)
+			return false;
+		if (!dispcnt.load(is))
+			return false;
+		if (!divider.load(is))
+			return false;
+		if (!sqrtunit.load(is))
+			return false;
+		/*if (!gxfifo.load(is))
+			return false;*/
+		if (version >= 1)
+			if (!wifi.load(is))
+				return false;
+#define LOAD(I, X, Y)            \
+	if (!I##_##X##_##Y.load(is)) \
+		return false;
+		LOAD(timer, 0, 0);
+		LOAD(timer, 0, 1);
+		LOAD(timer, 0, 2);
+		LOAD(timer, 0, 3);
+		LOAD(timer, 1, 0);
+		LOAD(timer, 1, 1);
+		LOAD(timer, 1, 2);
+		LOAD(timer, 1, 3);
+		LOAD(dma, 0, 0);
+		LOAD(dma, 0, 1);
+		LOAD(dma, 0, 2);
+		LOAD(dma, 0, 3);
+		LOAD(dma, 1, 0);
+		LOAD(dma, 1, 1);
+		LOAD(dma, 1, 2);
+		LOAD(dma, 1, 3);
 #undef LOAD
 
 		return true;
@@ -1187,7 +1530,7 @@ void NDS_RescheduleGXFIFO(u32 cost)
 	}
 	MMU.gfx3dCycles += cost;
 	
-	sequencer.reschedule = true;
+	NDS_ReschedulePtr = true;
 }
 
 void NDS_RescheduleTimers()
@@ -1197,13 +1540,13 @@ void NDS_RescheduleTimers()
 	check(1,0); check(1,1); check(1,2); check(1,3);
 #undef check
 
-	sequencer.reschedule = true;
+	NDS_ReschedulePtr = true;
 }
 
 void NDS_RescheduleDMA()
 {
 	//TBD
-	sequencer.reschedule = true;
+	NDS_ReschedulePtr = true;
 }
 
 
@@ -1232,7 +1575,7 @@ void Sequencer::init()
 	NDS_RescheduleTimers();
 	NDS_RescheduleDMA();
 
-	reschedule = false;
+	NDS_ReschedulePtr = 0;
 	nds_timer = 0;
 	nds_arm9_timer = 0;
 	nds_arm7_timer = 0;
@@ -1289,7 +1632,11 @@ static void execHardware_hblank()
 static void execHardware_hstart_vblankEnd()
 {
 	sequencer.nds_vblankEnded = true;
-	sequencer.reschedule = true;
+
+	// Per-frame host work: input, frame pacing, FPS counter.
+	extern void desmume_cycle();
+	desmume_cycle();
+	NDS_ReschedulePtr = true;
 
 	//turn off vblank status bit
 	T1WriteWord(MMU.ARM9_REG, 4, T1ReadWord(MMU.ARM9_REG, 4) & ~1);
@@ -1387,7 +1734,7 @@ static void execHardware_hstart_irq()
 	//100% accurate emulation would require the read of VCOUNT to be in the pipeline already with the irq coming in behind it, thus 
 	//allowing the vcount to register as 192 occasionally (maybe about 1 out of 28 frames)
 	//the actual length of the delay is in execHardware() where the events are scheduled
-	sequencer.reschedule = true;
+	NDS_ReschedulePtr = true;
 	if(nds.hw_status.VCount==192)
 	{
 		//when the vcount hits 192, vblank begins
@@ -1488,7 +1835,7 @@ static void execHardware_hstart()
 
 void NDS_Reschedule()
 {
-	sequencer.reschedule = true;
+	NDS_ReschedulePtr = true;
 }
 
 FORCEINLINE u32 _fast_min32(u32 a, u32 b, u32 c, u32 d)
@@ -1658,175 +2005,243 @@ bool nds_loadstate(EMUFILE* is, int size)
 // takes the JIT out of the picture when chasing a hang).
 #define NDS_USE_JIT false
 
-static const int kMaxWork = 4000;
-static const int kIrqWait = 4000;
+const int kIrqWait = 4000;
+const int kMaxWork = 4000;
 
-template<bool doarm9, bool doarm7>
-static FORCEINLINE s32 minarmtime(s32 arm9, s32 arm7)
+s32 arm9 = 0;
+s32 arm7 = 0;
+s32 s32next = 0;
+u64 old_next = 0;
+
+EventID nextEvent;
+
+#if 0
+void exec_cpu()
 {
-	if(doarm9)
-		if(doarm7)
-			return min(arm9,arm7);
-		else
-			return arm9;
-	else
-		return arm7;
-}
+	NDS_ReschedulePtr = 0;
 
-template<bool doarm9, bool doarm7, bool jit>
-static FORCEINLINE u32 armInnerLoop(
-const u64 nds_timer_base, const s32 s32next, s32 arm9, s32 arm7)
-{
-	s32 timer = minarmtime<doarm9,doarm7>(arm9,arm7);
+	s32 s32next = sequencer.popNext(nextEvent);
 
-	bool skipARM7 = false;
+	u64 nds_timer_base = nds_timer;
+	arm9 = static_cast<s32>(nds_arm9_timer - nds_timer);
+	arm7 = static_cast<s32>(nds_arm7_timer - nds_timer);
+	
+	// Always work in signed time
+	s32 armtime = std::min(arm9, arm7);
 
-	while(timer < s32next && !sequencer.reschedule)
+	// Pick the CPU whose next event is earliest
+	
+	
+	/*while (armtime < s32next && NDS_ReschedulePtr == 0 )
 	{
 
-		if(doarm9 && (!doarm7 || arm9 <= timer))
+		const bool runArm9 = (arm9 <= arm7);
+		
+		if (runArm9)
 		{
-			if(!(NDS_ARM9.freeze & CPU_FREEZE_WAIT_IRQ) && !nds.freezeBus && !ARM9_SKIP_HACK)
+			if (!(NDS_ARM9.freeze & CPU_FREEZE_WAIT_IRQ) && !nds.freezeBus)
 			{
-				arm9 += armcpu_exec<ARMCPU_ARM9,jit>();
-
-				timer = minarmtime<doarm9,doarm7>(arm9,arm7);
-				nds_timer = nds_timer_base + timer;
-				continue;
+				arm9 += armcpu_exec<ARMCPU_ARM9, false>();  // JIT=true per your new path
 			}
-
-			s32 temp = arm9;
-			arm9 = min(s32next, arm9 + kIrqWait);
-			nds.idleCycles[0] += arm9-temp;
-			if (gxFIFO.size < 255) nds.freezeBus &= ~1;
+			else
+			{
+				const s32 prev = arm9;
+				arm9 = std::min(s32next, arm9 + kIrqWait);
+				nds.idleCycles[0] += (arm9 - prev);
+	
+				if (gxFIFO.size < 255)
+					nds.freezeBus &= ~1;
+			}
 		}
-		if((doarm7 || !skipARM7) && (!doarm9 || arm7 <= timer))
+		else
 		{
-			bool cpufreeze = !!(NDS_ARM7.freeze & (CPU_FREEZE_WAIT_IRQ|CPU_FREEZE_OVERCLOCK_HACK));
-
-			if(!cpufreeze && !nds.freezeBus && !ARM7_SKIP_HACK)
+			const bool cpufreeze = !!(NDS_ARM7.freeze & (CPU_FREEZE_WAIT_IRQ | CPU_FREEZE_OVERCLOCK_HACK));
+	
+			if (!cpufreeze && !nds.freezeBus)
 			{
-				arm7 += (armcpu_exec<ARMCPU_ARM7,jit>()<<1);
-
-				timer = minarmtime<doarm9,doarm7>(arm9,arm7);
-				nds_timer = nds_timer_base + timer;
-				continue;
+				// ARM7 runs at half speed → <<1 after armcpu_exec (like old code)
+			 	arm7 += (armcpu_exec<ARMCPU_ARM7>() << 1);
 			}
-			
-			s32 temp = arm7;
-			arm7 = min(s32next, arm7 + kIrqWait);
-			nds.idleCycles[1] += arm7-temp;
+			else
+			{
+				const s32 prev = arm7;
+				arm7 = std::min(s32next, arm7 + kIrqWait);
+				nds.idleCycles[1] += (arm7 - prev);
+			}
+		}
+	
+		// Advance global time by the earliest CPU time
+		armtime = std::min(arm9, arm7);
+		nds_timer = nds_timer_base + armtime;
 
-			skipARM7 = !(arm7 - s32next);
-			/*{
-				nds_timer = nds_timer_base + minarmtime<doarm9,false>(arm9,arm7);
-				return armInnerLoop<doarm9,false,jit>(nds_timer_base, s32next, arm9, arm7);
-			}*/
+	}*/
+	
+	if (sequencer.gxfifo.isTriggered())
+	{
+		gfx3d_execute3D();
+	}
+
+	/*printf("IME: %s, IF: %08X, IE: %08X\n",
+		MMU.reg_IME[0] ? "enabled" : "disabled",
+		MMU.gen_IF<0>(),
+		MMU.reg_IE[0]);
+*/
+	/*printf("Status: %s %d cycles, %d idle cycles. Bus %s\n",
+	NDS_ARM9.freeze & CPU_FREEZE_WAIT_IRQ ? "waiting for IRQ" : "idle",
+	arm9, nds.idleCycles[0], nds.freezeBus ? "frozen" : "unfrozen");*/
+
+	nds_timer = nds_timer_base + armtime;
+
+	nds_arm9_timer = nds_timer_base + arm9;
+	nds_arm9_timer = nds_timer_base + arm7;
+	//nds_arm7_timer = nds_timer_base + arm7;
+
+	
+	sequencer.updateEventCycle(nextEvent, armtime);
+}
+#endif
+
+void exec_cpu()
+{
+#if PROFILER_ENABLED
+	const u32 _prof_t9 = sceKernelGetSystemTimeLow();
+#endif
+	NDS_ReschedulePtr = 0;
+
+	s32next = sequencer.popNext(nextEvent);
+
+	u64 nds_timer_base = nds_timer;
+	arm9 = (s32)(nds_arm9_timer - nds_timer);
+	arm7 = (s32)(nds_arm7_timer - nds_timer);
+
+#if PROFILER_ENABLED
+	const s32 _prof_arm9_start = arm9;
+	const u32 _prof_idle_start = nds.idleCycles[0];
+#endif
+
+	// Interleave the two CPUs on the minimum of their clocks, stepping whichever
+	// is behind -- upstream's armInnerLoop scheme. Running the ARM7 in a burst
+	// instead deadlocks the pair: they talk over IPC, so the ARM9 must get a turn
+	// to answer while the ARM7 waits.
+	s32 timer = std::min(arm9, arm7);
+
+	while (timer < s32next && NDS_ReschedulePtr == 0)
+	{
+		if (arm9 <= timer)
+		{
+#if PROFILER_ENABLED
+			g_prof_a9_calls++;
+#endif
+			if (!(NDS_ARM9.freeze & CPU_FREEZE_WAIT_IRQ) && !nds.freezeBus && !NDS_ARM9.idle_loop)
+			{
+				arm9 += armcpu_exec<ARMCPU_ARM9, NDS_USE_JIT>();
+			}
+			else
+			{
+				// idle_loop: the JIT detected a spin only the next scheduled
+				// event can break, so jump straight to it.
+				nds.idleCycles[0] += (s32next - arm9);
+				arm9 = s32next;
+
+				if (nds.freezeBus && gxFIFO.size < 255)
+					nds.freezeBus &= ~1;
+			}
 		}
 
-		timer = minarmtime<doarm9,doarm7>(arm9,arm7);
+		if (arm7 <= timer)
+		{
+			const bool frozen =
+				!!(NDS_ARM7.freeze & (CPU_FREEZE_WAIT_IRQ | CPU_FREEZE_OVERCLOCK_HACK));
 
+			if (!frozen && !nds.freezeBus)
+			{
+				// ARM7 runs at half the ARM9 clock -> <<1 to convert to ARM9 time.
+				arm7 += (armcpu_exec<ARMCPU_ARM7, NDS_USE_JIT>() << 1);
+			}
+			else
+			{
+				const s32 prev = arm7;
+				arm7 = std::min(s32next, arm7 + kIrqWait);
+				nds.idleCycles[1] += (arm7 - prev);
+			}
+		}
+
+		timer = std::min(arm9, arm7);
 		nds_timer = nds_timer_base + timer;
 	}
 
-	return (arm9<<16|arm7);
+	nds_timer = nds_timer_base + timer;
+
+	/*printf("Status: %s %d cycles, %d idle cycles. Bus %s\n",
+	NDS_ARM9.freeze & CPU_FREEZE_WAIT_IRQ ? "waiting for IRQ" : "idle",
+	arm9, nds.idleCycles[0], nds.freezeBus ? "frozen" : "unfrozen");*/
+	
+	if (sequencer.gxfifo.isTriggered())
+	{
+		gfx3d_execute3D();
+	}
+
+
+	nds_arm9_timer = nds_timer_base + arm9;
+	nds_arm7_timer = nds_timer_base + arm7;   // real ARM7 time, not arm9>>1
+
+
+	sequencer.updateEventCycle(nextEvent, arm9);
+
+#if PROFILER_ENABLED
+	g_prof_a9_cyc  += (u32)(arm9 - _prof_arm9_start);
+	g_prof_a9_idle += (nds.idleCycles[0] - _prof_idle_start);
+	g_prof_arm9_us += sceKernelGetSystemTimeLow() - _prof_t9;
+#endif
 }
 
-template<bool FORCE>
-void NDS_exec(s32 nb)
+// This will be our instruction pointer for the NDS execution loop in asm in order to have a better instruction management.
+uint8_t *NDS_exec_code = ((uint8_t *)(SCRATCHPAD_ADDR + 0x1000));
+
+void exec_hw()
 {
-	sequencer.nds_vblankEnded = false;
-	ARM9_SKIP_HACK = false;
-
-	if(nds.hw_status.sleeping)
-	{
-		//speculative code: if ANY irq happens, wake up the arm7.
-		//I think the arm7 program analyzes the system and may decide not to wake up
-		//if it is dissatisfied with the conditions
-		if((MMU.reg_IE[1] & MMU.gen_IF<1>()))
-		{
-			nds.hw_status.sleeping = FALSE;
-		}
-
-		return;
-	}
-
-	for(;;)
-	{
-
-		sequencer.execHardware();
-
-		//break out once per frame
-		if(unlikely(sequencer.nds_vblankEnded)) break;
-		//it should be benign to execute execHardware in the next frame,
-		//since there won't be anything for it to do (everything should be scheduled in the future)
-
-		execHardware_interrupts();
-
-		//find next work unit:
-		u64 next = sequencer.findNext();
-		next = min(next,nds_timer+kMaxWork); //lets set an upper limit for now
+	// it should be begin to execute execHardware in the next frame,
+	// since there won't be anything for it to do (everything should be scheduled in the future)
+#if PROFILER_ENABLED
+	const u32 _prof_thw = sceKernelGetSystemTimeLow();
+	sequencer.execHardware();
+	extern u32 g_prof_hw_us;
+	g_prof_hw_us += sceKernelGetSystemTimeLow() - _prof_thw;
+#else
+	sequencer.execHardware();
+#endif
+}
 
 
-		sequencer.reschedule = false;
+void NDS_setup()
+{
+	// check_nitro_sdk() is HLE-only; not ported.
 
-		//cast these down to 32bits so that things run faster on 32bit procs
-		u64 nds_timer_base = nds_timer;
-		s32 arm9 = (s32)(nds_arm9_timer-nds_timer);
-		s32 arm7 = (s32)(nds_arm7_timer-nds_timer);
-		s32 s32next = (s32)(next-nds_timer);
+	u32 last_addr = emit_Set(0);
+	set_code_cache(NDS_exec_code);
 
-		u32 arm9arm7 = armInnerLoop<true,true,NDS_USE_JIT>(nds_timer_base,s32next,arm9,arm7);
+	void *loop_label = emit_GetPtr();
 
-		//ARM7_SKIP_HACK = nds.hw_status.VCount < 180 || (my_config.extrmarm7down && nds.hw_status.VCount > 230);
-		//ARM7_SKIP_HACK = (nds.hw_status.VCount > 230 && ipc_fifo[ARM7].size > 0) || nds.hw_status.VCount < 185;
+	emit_jal((u32)exec_hw);
+	emit_nop();
 
-		//ARM9_SKIP_HACK = nds.hw_status.VCount > 250;
+	emit_jal((u32)exec_cpu);
+	emit_nop(); // emit_sw(psp_zero, psp_t5, 80); // NDS_ReschedulePtr = 0;
 
-		//math_underclock = nds.hw_status.VCount > 250;
+	emit_jal((u32)execHardware_interrupts);
+	emit_nop(); // emit_lui(psp_t5, 0x1);
 
-		arm9 = arm9arm7>>16;
-		arm7 = arm9arm7&0xFFFF;
-		nds_arm9_timer = nds_timer_base+arm9;
-		nds_arm7_timer = nds_timer_base+arm7;
+	emit_j(loop_label); // jump to the loop label
+	emit_nop();
 
-		//if we were waiting for an irq, don't wait too long:
-		//let's re-analyze it after this hardware event (this rolls back a big burst of irq waiting which may have been interrupted by a resynch)
-		if(NDS_ARM9.freeze & CPU_FREEZE_WAIT_IRQ)
-		{
-			nds.idleCycles[0] -= (s32)(nds_arm9_timer-nds_timer);
-			nds_arm9_timer = nds_timer;
-		}
+	make_address_range_executable((u32)loop_label, (u32)emit_GetPtr());
 
-		if (NDS_ARM7.freeze & CPU_FREEZE_WAIT_IRQ)
-		{
-			nds.idleCycles[1] -= (s32)nds_arm7_timer-nds_timer;
-			nds_arm7_timer = nds_timer;
-		}
-	}
+	emit_Set(last_addr);
+	set_code_cache(NULL);
 
-	if (PSP_UC(RenderDone)){
-		PSP_UC(Do2dRender) = true;
-		EMU_SCREEN();
-		EMU_SCREEN_Finish();
-		return;
-	}
+	printf("NDS execution code generated at %p.\n", loop_label);
 
-	if (IsEmu()){
-		// GPU_RenderLine draws into GPU_Screen/GPU_Screen_extra, but EMU_SCREEN
-		// samples VRAM at DISP_POINTER (0x44100000). Copy them across first --
-		// without this the frame is rendered somewhere the display never reads.
-		const int sz_SCR = 512 * 192 * 2;
-		sceDmacMemcpy((void*)(0x04100000), (void*)&GPU_Screen[0], sz_SCR);
-		sceDmacMemcpy((void*)(0x04100000 + sz_SCR), (void*)&GPU_Screen_extra[0], sz_SCR);
-
-		renderScreenFull();
-		EMU_SCREEN();
-	}
-
-	// The ported PSPDisplay presents the frame here, not inside EMU_SCREEN:
-	// its double-buffer scheme moved sceGuSwapBuffers() into this call.
-	EMU_SCREEN_Finish();
+	((void (*)())loop_label)();
 }
 
 template<int PROCNUM> static void execHardware_interrupts_core()
@@ -2766,6 +3181,4 @@ bool ValidateSlot2Access(u32 procnum, u32 demandSRAMSpeed, u32 demand1stROMSpeed
 }
 
 //these templates needed to be instantiated manually
-template void NDS_exec<FALSE>(s32 nb);
-template void NDS_exec<TRUE>(s32 nb);
 

@@ -151,30 +151,73 @@ void deinit()
 	sceKernelExitGame();
 }
 
-static void desmume_cycle()
+constexpr int max_framerate[] = {
+    1000000 / 1000, 1000000 / 60, 1000000 / 50,
+    1000000 / 40,   1000000 / 30, 1000000 / 25,
+};
+// Called once per frame by the sequencer at the end of vblank. Everything that
+// used to live in main()'s while-loop happens here now: input, frame pacing and
+// the FPS counter.
+void desmume_cycle()
 {
-	 u16 pad = 0;
+	u16 pad = 0;
+	static u32 last_fps_timing = 0;
+	static u32 previous_time = 0;
+	static u32 fps_frame_counter = 0;
+	static u8  _frameskip = 0;
 
-	 process_ctrls_event(pad);
+	process_ctrls_event(pad);
 
-    /* Update mouse position and click */
-	  if (!mouse.click)
-	  {
-      NDS_releaseTouchDirect();
-	  }
-	  else {
-		   NDS_setTouchPosDirect(mouse.x, mouse.y);
-	  }
+	/* Update mouse position and click */
+	if (!mouse.click)
+		NDS_releaseTouchDirect();
+	else
+		NDS_setTouchPosDirect(mouse.x, mouse.y);
 
-    // Pad state is applied by process_ctrls_event() above (the ported ctrlssdl
-    // calls NDS_applyFinalInputDirect); update_keypad was never defined.
+	if (my_config.frameskip != 0)
+	{
+		if (_frameskip--)
+			NDS_SkipNextFrame();
+		else
+			_frameskip = my_config.frameskip;
+	}
 
-  if (my_config.showfps)
-      ShowFPS(0,3);
+	const u32 curr_timing = sceKernelGetSystemTimeLow();
+
+	++fps_frame_counter;
+	if (curr_timing - last_fps_timing >= 1000000)
+	{
+		FPS_Counter = fps_frame_counter;
+		fps_frame_counter = 0;
+		last_fps_timing = curr_timing;
+	}
+
+	// Frame-rate limiting. Advancing previous_time by exactly one frame period
+	// (rather than snapping it to now) keeps the pacing steady and lets a late
+	// frame be made up for, instead of drifting.
+	if (my_config.fps_cap_num > 0)
+	{
+		const int cap_idx = (my_config.fps_cap_num < (int)(sizeof(max_framerate) / sizeof(max_framerate[0])))
+		                    ? my_config.fps_cap_num : 1;
+		const int FRAME_TIME_MICROSEC = max_framerate[cap_idx];
+		const u32 elapsed = curr_timing - previous_time;
+
+		if (elapsed < (u32)FRAME_TIME_MICROSEC)
+		{
+			sceKernelDelayThread(FRAME_TIME_MICROSEC - elapsed);
+			previous_time += FRAME_TIME_MICROSEC;
+		}
+		else
+			previous_time = curr_timing;
+	}
+
+	if (my_config.showfps)
+		ShowFPS(0, 3);
 
 	if (my_config.enable_sound)
 		SPU_Emulate_user();
 }
+
 
 
 void vdDejaLog(char *msg)
@@ -282,10 +325,7 @@ void ResetRom() {
 
 // Frame-rate cap, selectable from the menu (my_config.fps_cap_num):
 //   0 = uncapped (frameskip only), then 60, 50, 40, 30, 25 fps.
-constexpr int max_framerate[] = {
-    1000000 / 1000, 1000000 / 60, 1000000 / 50,
-    1000000 / 40,   1000000 / 30, 1000000 / 25,
-};
+
 
 int main(int argc, char **argv) {
 
@@ -333,56 +373,12 @@ int main(int argc, char **argv) {
 
   printf("Ram: %d\n", RAMAMOUNT());
 
-  while(execute)
-  {
-      
-    // desmume_cycle() is where input is read (process_ctrls_event) and the
-    // touch state applied, so it has to run every frame. The old shape skipped
-    // it entirely on the frame that reloaded the counter, which made the touch
-    // drop out whenever frameskip was on.
-    desmume_cycle();
-
-    if (my_config.frameskip != 0)
-    {
-      if (_frameskip--)
-        NDS_SkipNextFrame();
-      else
-        _frameskip = my_config.frameskip;
-    }
-
-    u32 curr_timing = sceKernelGetSystemTimeLow();
-
-    NDS_exec<false>();
-
-    ++fps_frame_counter;
-
-    if(curr_timing - last_fps_timing >= 1000000)
-    {
-      FPS_Counter = fps_frame_counter;//(fps_frame_counter * 1000000) / (curr_timing - last_fps_timing);
-      fps_frame_counter = 0;
-      last_fps_timing = curr_timing;
-    }
-
-    // Frame-rate limiting. Advancing previous_time by exactly one frame period
-    // (rather than snapping it to now) keeps the pacing steady and lets a late
-    // frame be made up for, instead of drifting.
-    if (my_config.fps_cap_num > 0)
-    {
-        // Clamp: a stale or hand-edited config must not index out of the table.
-        const int cap_idx = (my_config.fps_cap_num < (int)(sizeof(max_framerate) / sizeof(max_framerate[0])))
-                            ? my_config.fps_cap_num : 1;
-        const int FRAME_TIME_MICROSEC = max_framerate[cap_idx];
-        const u32 elapsedFrameTime = curr_timing - previous_time;
-
-        if (elapsedFrameTime < (u32)FRAME_TIME_MICROSEC)
-        {
-          sceKernelDelayThread(FRAME_TIME_MICROSEC - elapsedFrameTime);
-          previous_time += FRAME_TIME_MICROSEC;
-        }
-        else
-          previous_time = curr_timing;   // running behind: resync
-    }
-  }
+  // The exec loop is generated MIPS (NDS_setup -> exec_hw / exec_cpu /
+  // execHardware_interrupts) and never returns; per-frame work that used to sit
+  // in this while-loop now runs from desmume_cycle(), which the sequencer calls
+  // at the end of vblank.
+  extern void NDS_setup();
+  NDS_setup();
 
   NDS_DeInit();
   return 0;
