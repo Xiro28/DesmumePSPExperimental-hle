@@ -47,7 +47,7 @@ inline void* vrelptr(void* ptr)
 // the matrix math. GU_CLIP_PLANES is disabled to work around the near-plane clipper
 // that dropped straddling triangles in the previous (reverted) attempt. Default 0
 // (keep the proven CPU TRANSFORM_2D path). Flip to 1 to test.
-#define GU_HW_TRANSFORM 1
+#define GU_HW_TRANSFORM 0
 
 // Runtime-tweakable Y-flip controls so we can find the right orientation without a
 // rebuild per attempt. Change via debugger / a menu toggle, or edit the defaults.
