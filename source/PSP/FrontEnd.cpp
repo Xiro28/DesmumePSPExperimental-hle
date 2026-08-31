@@ -1,5 +1,4 @@
 #include <pspkernel.h>
-
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
@@ -9,632 +8,944 @@
 #include <time.h>
 #include <pspdebug.h>
 #include <math.h>
-#include <string.h>
 #include <pspctrl.h>
 #include <pspgu.h>
 #include "FrontEnd.h"
 #include <psprtc.h>
 #include <pspdisplay.h>
-
+#include <strings.h> // Provides strcasecmp
+#include <pspiofilemgr.h> // sceIoMkdir for per-ROM config storage
+#include <unistd.h>       // getcwd
+#include <dirent.h>       // opendir/readdir for the ROM file list
 #include "PSPDisplay.h"
-//#include "Version.h"
 
-configP configparms[30];
-int totalconfig=0;
-int totalconfigDebug=0;
+// JIT-vs-interpreter differential test (source/jit_difftest.cpp), run from the
+// ROM-selection menu via TRIANGLE.
+// The new JIT's tunables live in arm_jit.cpp in the -hle tree, which is not
+// ported yet. Define them here so the menu still links; porting the JIT will
+// move these to their real home.
+extern "C" const int g_jit_cycles_in_reg = 0;
+unsigned char jit_opt_constprop  = 1;
+unsigned char jit_opt_condmerge  = 1;
+unsigned char jit_opt_thumbflags = 1;
+unsigned char jit_opt_fastmem    = 1;
 
+// jit_difftest is not ported to this tree yet (it belongs with the JIT work).
+static void jit_difftest_run_force() {}
 
-void InitConfigParms(configured_features * params){
-	int c=0;
+//---------------------------------------------------------------------
+// SETTINGS structure (SETTINGS / MAX_SETTINGS now declared in FrontEnd.h so
+// the ROM-menu renderer can read settings[] for the split-screen panel).
+//---------------------------------------------------------------------
+SETTINGS settings[MAX_SETTINGS];
+int totalSettings = 0;		// Count of the main settings
+int totalSettingsDebug = 0; // Count of main settings plus debug settings
 
-    strcpy(configparms[c].name,"Screen SWAP");
-	params->swap = configparms[c].var;
-	c++;
-	strcpy(configparms[c].name,"Show Touch Cursor");
-	params->cur = configparms[c].var;
-	c++;
-	strcpy(configparms[c].name,"Show FPS");
-	params->showfps = configparms[c].var;
-	c++;
-#ifndef LOWRAM
-	strcpy(configparms[c].name,"Enable Audio");
-	params->enable_sound = configparms[c].var;
-	c++;
-#endif
-	strcpy(configparms[c].name,"3D Frameskip");
-	params->frameskip = configparms[c].var;
-	c++;
-    strcpy(configparms[c].name,"Language");
-	params->firmware_language = configparms[c].var;
-	c++;
-	strcpy(configparms[c].name,"Render 3D");
-	params->Render3D = configparms[c].var;
-	c++;
-	strcpy(configparms[c].name, "Fast ME Rendering");
-	params->FastMERendering = configparms[c].var;
-	c++;
-	strcpy(configparms[c].name, "FPS Cap");
-	params->fps_cap = configparms[c].var;
-	c++;
-	strcpy(configparms[c].name, "Extreme ARM7 downclock");
-	params->extrmarm7down = configparms[c].var;
-	c++;
-	/*strcpy(configparms[c].name, "Hide screen");
-	params->hide_screen = configparms[c].var;
-	c++;*/
-	
-	totalconfig = c;
-	
-	/*strcpy(configparms[c].name, "Disable 3d calculation");
-	params->Disable_3D_calc = configparms[c].var;
-	c++;
-	strcpy(configparms[c].name, "Disable ARM7");
-	params->D_ARM7 = configparms[c].var;
-	c++;*/
-	/*strcpy(configparms[c].name,"Max FPS");
-	params->fps_cap_num = configparms[c].var;
-	c++;*/
+SETTINGS expSettings[MAX_EXP_SETTINGS];  // Experimental optimizations tab
+int totalExp = 0;
 
-	//
-	
-}
+extern "C" const int g_jit_cycles_in_reg;   // reflects compile-time JIT_CYCLES_IN_REG
+extern unsigned char jit_opt_constprop;     // runtime JIT optimization toggles (arm_jit.h)
+extern unsigned char jit_opt_condmerge;
+extern unsigned char jit_opt_thumbflags;
+extern unsigned char jit_opt_fastmem;
 
+//---------------------------------------------------------------------
+// Global variables used by the menus
+//---------------------------------------------------------------------
+int selposconfig = 0;
+int selposDebug = 0;
 bool changed = false;
 
-void InitDisplayParams(configured_features* params) {
-
-	if (changed) return;
-
-	int c = totalconfig;
-	strcpy(configparms[c].name, "BG0 TOP");
-	params->gpuLayerEnabled[0][0] = true;
-	c++;
-	strcpy(configparms[c].name, "BG1 TOP");
-	params->gpuLayerEnabled[0][1] = true;
-	c++;
-	strcpy(configparms[c].name, "BG2 TOP");
-	params->gpuLayerEnabled[0][2] = true;
-	c++;
-	strcpy(configparms[c].name, "BG3 TOP");
-	params->gpuLayerEnabled[0][3] = true;
-	c++;
-	strcpy(configparms[c].name, "OBJ TOP");
-	params->gpuLayerEnabled[0][4] = true;
-	c++;
-
-	strcpy(configparms[c].name, "BG0 Bottom");
-	params->gpuLayerEnabled[1][0] = true;
-	c++;
-	strcpy(configparms[c].name, "BG1 Bottom");
-	params->gpuLayerEnabled[1][1] = true;
-	c++;
-	strcpy(configparms[c].name, "BG2 Bottom");
-	params->gpuLayerEnabled[1][2] = true;
-	c++;
-	strcpy(configparms[c].name, "BG3 Bottom");
-	params->gpuLayerEnabled[1][3] = true;
-	c++;
-	strcpy(configparms[c].name, "OBJ Bottom");
-	params->gpuLayerEnabled[1][4] = true;
-	c++;
-	totalconfigDebug = c;
+//---------------------------------------------------------------------
+// Helper function: Adds a new setting into the global settings array.
+//---------------------------------------------------------------------
+int addSetting(SETTINGS *setArr, int index, const char *name, const char *desc, int defaultValue)
+{
+	if (index >= MAX_SETTINGS)
+		return index;
+	strncpy(setArr[index].name, name, sizeof(setArr[index].name) - 1);
+	setArr[index].name[sizeof(setArr[index].name) - 1] = '\0';
+	strncpy(setArr[index].description, desc, sizeof(setArr[index].description) - 1);
+	setArr[index].description[sizeof(setArr[index].description) - 1] = '\0';
+	setArr[index].value = defaultValue;
+	return index + 1;
 }
 
-void ChangeValueDebug(configured_features* params) {
-	int c = totalconfig;
-	strcpy(configparms[c].name, "BG0 TOP");
-	params->gpuLayerEnabled[0][0] = configparms[c].var;
-	c++;
-	strcpy(configparms[c].name, "BG1 TOP");
-	params->gpuLayerEnabled[0][1] = configparms[c].var;
-	c++;
-	strcpy(configparms[c].name, "BG2 TOP");
-	params->gpuLayerEnabled[0][2] = configparms[c].var;
-	c++;
-	strcpy(configparms[c].name, "BG3 TOP");
-	params->gpuLayerEnabled[0][3] = configparms[c].var;
-	c++;
-	strcpy(configparms[c].name, "OBJ TOP");
-	params->gpuLayerEnabled[0][4] = configparms[c].var;
-	c++;
-
-	strcpy(configparms[c].name, "BG0 Bottom");
-	params->gpuLayerEnabled[1][0] = configparms[c].var;
-	c++;
-	strcpy(configparms[c].name, "BG1 Bottom");
-	params->gpuLayerEnabled[1][1] = configparms[c].var;
-	c++;
-	strcpy(configparms[c].name, "BG2 Bottom");
-	params->gpuLayerEnabled[1][2] = configparms[c].var;
-	c++;
-	strcpy(configparms[c].name, "BG3 Bottom");
-	params->gpuLayerEnabled[1][3] = configparms[c].var;
-	c++;
-	strcpy(configparms[c].name, "OBJ Bottom");
-	params->gpuLayerEnabled[1][4] = configparms[c].var;
-	c++;
-	
-	totalconfigDebug = c;
+//---------------------------------------------------------------------
+// Helper function: Map a language number to its text representation.
+// Mapping: 0 = JAP, 1 = ENG, 2 = FRE, 3 = GER, 4 = ITA, 5 = SPA, 6 = CHI, 7 = RES
+//---------------------------------------------------------------------
+const char *GetLanguageText(int lang)
+{
+	static const char *langMap[8] = {"JAP", "ENG", "FRE", "GER", "ITA", "SPA", "CHI", "RES"};
+	if (lang < 0 || lang >= 8)
+		return "UNK";
+	return langMap[lang];
 }
 
-int selposconfig=0;
-int selposDebug=0;
+const char *GetFPSCapText(int val){
+	static const char *capMap[] = {"No cap", "60", "50", "40", "30", "25"};
+	if (val < 0 || val >= 6)
+		return "UNK";
+	return capMap[val];
+}
 
-void DisplayConfigParms(){
-	int c;
+//---------------------------------------------------------------------
+// Initialize the main configuration settings and map them to the
+// corresponding fields in the configured_features structure.
+//---------------------------------------------------------------------
+void InitMainSettings(configured_features *params)
+{
+	int c = 0;
+	c = addSetting(settings, c, "Screen SWAP", "Swap the screen buffers", 0);
+	params->swap = settings[0].value;
 
-	for (c=0;c<totalconfig;c++){
-	 	
-	    if(selposconfig == c)
+	c = addSetting(settings, c, "Show Touch Cursor", "Display the touch cursor", 0);
+	params->cur = settings[1].value;
+
+	c = addSetting(settings, c, "Show FPS", "Display frame rate on screen", 1);
+	params->showfps = settings[2].value;
+
+	c = addSetting(settings, c, "Enable Audio", "Enable sound output", 0);
+	params->enable_sound = settings[3].value;
+
+	c = addSetting(settings, c, "Frameskip", "Skip frames to improve performance", 0);
+	params->frameskip = settings[4].value;
+
+	// The language setting will be displayed as text.
+	c = addSetting(settings, c, "Language", "Select firmware language", 1);
+	params->firmware_language = settings[5].value;
+
+	c = addSetting(settings, c, "Render 3D", "Enable 3D rendering", 1);
+	params->Render3D = settings[6].value;
+
+	//c = addSetting(settings, c, "Fast ME Rendering", "Enable fast ME rendering", 0);
+	//params->FastMERendering = settings[7].value;
+
+	c = addSetting(settings, c, "FPS Cap", "Limit the frames per second", 1);
+	params->fps_cap_num = settings[7].value;
+
+	//c = addSetting(settings, c, "Use cached Interpreter", "For a better stability but sometimes slower", 0);
+	//params->cached_interpreter = settings[8].value;
+
+	c = addSetting(settings, c, "3D UI depth fix", "OFF=normal depth order. ON=fix coplanar 2D-UI games (Tetris DS menus) by ordering full-screen backgrounds first. Wrong for some games, so opt-in.", 0);
+	params->sort_3d = settings[8].value;
+
+	c = addSetting(settings, c, "3D always on top", "Draw 3D always on top of 2D scene", 0);
+	params->_3d_always_on_top = settings[9].value;
+
+	c = addSetting(settings, c, "AOT Pre-compile", "Compile all code before game starts (saved for next run)", 0);
+	params->aot_precompile = settings[10].value;
+
+	totalSettings = c;
+
+	// Experimental JIT flags default ON, so boot paths that never open the
+	// Experimental tab still get the optimizations. (InitExperimentalSettings
+	// overrides from expSettings[] when the menu/per-ROM config is loaded.)
+	params->exp_idle_loop   = true;
+	params->exp_block_link  = true;
+	params->exp_cycles_reg  = g_jit_cycles_in_reg;
+	params->exp_icache_align = true;
+	params->exp_early_term  = true;
+}
+
+void FinalizeMainSettings(configured_features *params)
+{
+	params->swap = settings[0].value;
+	params->cur = settings[1].value;
+	params->showfps = settings[2].value;
+	params->enable_sound = settings[3].value;
+	params->frameskip = settings[4].value;
+	params->firmware_language = settings[5].value;
+	params->Render3D = settings[6].value;
+	//params->FastMERendering = settings[7].value;
+	params->fps_cap_num = settings[7].value;
+	params->sort_3d = settings[8].value;
+	params->_3d_always_on_top = settings[9].value;
+	params->aot_precompile = settings[10].value;
+}
+
+//---------------------------------------------------------------------
+// Experimental JIT optimizations tab.
+//---------------------------------------------------------------------
+void InitExperimentalSettings(configured_features *params)
+{
+	int c = 0;
+	c = addSetting(expSettings, c, "Idle Loop Skip", "Detect idle loops and skip their cycles. Big speedup; rarely causes timing glitches.", 1);
+	params->exp_idle_loop = expSettings[0].value;
+
+	c = addSetting(expSettings, c, "Block Linking", "Chain directly between compiled blocks (inline dispatch). Faster; disable to debug.", 1);
+	params->exp_block_link = expSettings[1].value;
+
+	c = addSetting(expSettings, c, "Cycles In Register", "Hold the cycle counter in a CPU register (compile-time JIT_CYCLES_IN_REG; rebuild to change).", g_jit_cycles_in_reg);
+	params->exp_cycles_reg = expSettings[2].value;
+
+	c = addSetting(expSettings, c, "Const Propagation", "Fold compile-time-constant ALU results into immediates. Faster code; disable to debug.", 1);
+	c = addSetting(expSettings, c, "Cond Merging", "Skip re-evaluating flags for consecutive same-condition ops. Disable to debug.", 1);
+	c = addSetting(expSettings, c, "Thumb Flag Elim", "Drop dead flag computations in Thumb blocks. Disable to debug.", 1);
+	c = addSetting(expSettings, c, "Fast Memory", "Inline main-RAM word loads (skip the MMU C call). VERIFY with difftest; default off.", 0);
+
+	c = addSetting(expSettings, c, "ICache Align", "Align each compiled block to a 64-byte ICache line. Reduces cache-line splits on the PSP Allegrex (16KB 2-way ICache).", 1);
+	params->exp_icache_align = expSettings[7].value;
+
+	c = addSetting(expSettings, c, "Suffix Reuse", "Stop block early when the remaining instructions are already compiled; jump into that block. Reduces code-cache usage and recompilation.", 1);
+	params->exp_early_term = expSettings[8].value;
+
+	totalExp = c;
+
+	jit_opt_constprop  = expSettings[3].value;
+	jit_opt_condmerge  = expSettings[4].value;
+	jit_opt_thumbflags = expSettings[5].value;
+	jit_opt_fastmem    = expSettings[6].value;
+}
+
+void FinalizeExperimental(configured_features *params)
+{
+	params->exp_idle_loop   = expSettings[0].value;
+	params->exp_block_link  = expSettings[1].value;
+	params->exp_cycles_reg  = expSettings[2].value;
+	params->exp_icache_align = expSettings[7].value;
+	params->exp_early_term  = expSettings[8].value;
+
+	jit_opt_constprop  = expSettings[3].value;
+	jit_opt_condmerge  = expSettings[4].value;
+	jit_opt_thumbflags = expSettings[5].value;
+	jit_opt_fastmem    = expSettings[6].value;
+}
+
+
+
+//---------------------------------------------------------------------
+// Initialize the debug/display (GPU layer) settings.
+// These settings are appended to the main settings.
+//---------------------------------------------------------------------
+void InitDisplayParams(configured_features *params)
+{
+	if (changed)
+		return;
+
+	int c = totalSettings;
+	const char *namesTop[5] = {"BG0 TOP", "BG1 TOP", "BG2 TOP", "BG3 TOP", "OBJ TOP"};
+	const char *namesBottom[5] = {"BG0 Bottom", "BG1 Bottom", "BG2 Bottom", "BG3 Bottom", "OBJ Bottom"};
+
+	for (int j = 0; j < 5; j++)
+	{
+		char desc[128];
+		sprintf(desc, "Display flag for %s", namesTop[j]);
+		c = addSetting(settings, c, namesTop[j], desc, 1);
+		params->gpuLayerEnabled[0][j] = settings[c - 1].value;
+	}
+	for (int j = 0; j < 5; j++)
+	{
+		char desc[128];
+		sprintf(desc, "Display flag for %s", namesBottom[j]);
+		c = addSetting(settings, c, namesBottom[j], desc, 1);
+		params->gpuLayerEnabled[1][j] = settings[c - 1].value;
+	}
+	totalSettingsDebug = c;
+}
+
+//---------------------------------------------------------------------
+// Update the GPU/display settings from the settings array into
+// the configured_features structure.
+//---------------------------------------------------------------------
+void ChangeValueDebug(configured_features *params)
+{
+	int c = totalSettings;
+	for (int j = 0; j < 5; j++, c++)
+	{
+		params->gpuLayerEnabled[0][j] = settings[c].value;
+	}
+	for (int j = 0; j < 5; j++, c++)
+	{
+		params->gpuLayerEnabled[1][j] = settings[c].value;
+	}
+	totalSettingsDebug = c;
+}
+
+//---------------------------------------------------------------------
+// Display the main configuration settings. For the "Language" setting,
+// show its mapped text (JAP, ENG, etc.) instead of a number.
+//---------------------------------------------------------------------
+void DisplayConfigParms()
+{
+	int yPos = 8;
+	for (int i = 0; i < totalSettings; i++, yPos++)
+	{
+		// Insert section headers if desired.
+		if (i == 3)
 		{
-			pspDebugScreenSetTextColor(0x0000ffff); // Yellow
-		}else {
-			pspDebugScreenSetTextColor(0xffffffff); // red
+			pspDebugScreenSetXY(5, yPos++);
+			pspDebugScreenSetTextColor(0xff00ff00); // Green for sections
+			pspDebugScreenPrintf("[ MISC ]\n");
 		}
-		pspDebugScreenPrintf("  %s :  %d\n",configparms[c].name,configparms[c].var);
-		
+		else if (i == 0)
+		{
+			pspDebugScreenSetXY(5, yPos++);
+			pspDebugScreenSetTextColor(0xff00ff00);
+			pspDebugScreenPrintf("[ GUI ]\n");
+		}
+		pspDebugScreenSetXY(5, yPos);
+		if (strcmp(settings[i].name, "Language") == 0)
+		{
+			// Display language value as text.
+			if (i == selposconfig)
+			{
+				pspDebugScreenSetTextColor(0xffffff00);
+				pspDebugScreenPrintf("> %-12s : %s\n", settings[i].name, GetLanguageText(settings[i].value));
+			}
+			else
+			{
+				pspDebugScreenSetTextColor(0xffffffff);
+				pspDebugScreenPrintf("  %-12s : %s\n", settings[i].name, GetLanguageText(settings[i].value));
+			}
+		}
+		else if (strcmp(settings[i].name, "FPS Cap") == 0)
+		{
+			// Display language value as text.
+			if (i == selposconfig)
+			{
+				pspDebugScreenSetTextColor(0xffffff00);
+				pspDebugScreenPrintf("> %-12s : %s\n", settings[i].name, GetFPSCapText(settings[i].value));
+			}
+			else
+			{
+				pspDebugScreenSetTextColor(0xffffffff);
+				pspDebugScreenPrintf("  %-12s : %s\n", settings[i].name, GetFPSCapText(settings[i].value));
+			}
+		}
+		else
+		{
+			// All other settings display as an integer.
+			if (i == selposconfig)
+			{
+				pspDebugScreenSetTextColor(0xffffff00);
+				pspDebugScreenPrintf("> %-12s : %d\n", settings[i].name, settings[i].value);
+			}
+			else
+			{
+				pspDebugScreenSetTextColor(0xffffffff);
+				pspDebugScreenPrintf("  %-12s : %d\n", settings[i].name, settings[i].value);
+			}
+		}
 	}
 
+	// Leave a blank line and display the description of the currently selected setting.
+	yPos += 5;
+	pspDebugScreenSetXY(5, yPos);
+	pspDebugScreenSetTextColor(0xffffffff); // Green for the description text
+	pspDebugScreenPrintf("%s\n", settings[selposconfig].description);
 }
 
-void DisplayDebugParms() {
-	int c;
+//---------------------------------------------------------------------
+// Display the Experimental optimizations tab.
+//---------------------------------------------------------------------
+void DisplayExperimentalParms(int sel)
+{
+	int yPos = 8;
+	pspDebugScreenSetXY(5, yPos++);
+	pspDebugScreenSetTextColor(0xff00ff00);
+	pspDebugScreenPrintf("[ JIT EXPERIMENTAL ]\n");
 
-	for (c = totalconfig;c < totalconfigDebug;c++) {
+	for (int i = 0; i < totalExp; i++, yPos++)
+	{
+		pspDebugScreenSetXY(5, yPos);
+		if (i == sel)
+		{
+			pspDebugScreenSetTextColor(0xffffff00);
+			pspDebugScreenPrintf("> %-18s : %s\n", expSettings[i].name, expSettings[i].value ? "ON" : "OFF");
+		}
+		else
+		{
+			pspDebugScreenSetTextColor(0xffffffff);
+			pspDebugScreenPrintf("  %-18s : %s\n", expSettings[i].name, expSettings[i].value ? "ON" : "OFF");
+		}
+	}
 
+	yPos += 4;
+	pspDebugScreenSetXY(5, yPos);
+	pspDebugScreenSetTextColor(0xffffffff);
+	pspDebugScreenPrintf("%s\n", expSettings[sel].description);
+}
+
+//---------------------------------------------------------------------
+// Display the debug (GPU/display) settings.
+//---------------------------------------------------------------------
+void DisplayDebugParms()
+{
+	for (int c = totalSettings; c < totalSettingsDebug; c++)
+	{
 		if (selposDebug == c)
-		{
-			pspDebugScreenSetTextColor(0x0f00ffff); // Yellow
-		}
-		else {
-			pspDebugScreenSetTextColor(0xff00f55f); // red
-		}
-		pspDebugScreenPrintf("  %s :  %d\n", configparms[c].name, configparms[c].var);
-
+			pspDebugScreenSetTextColor(0x0f00ffff); // Yellow highlight
+		else
+			pspDebugScreenSetTextColor(0xff00f55f); // Red
+		pspDebugScreenPrintf("  %s : %d\n", settings[c].name, settings[c].value);
 	}
 }
 
-int frameposconfig = 1;
-int DBLSZ 		   = 100;
-int VcounTT  	   = 0;
-int langposconfig  = 0;
-int screenpos      = 0;
-
-void Debug(configured_features* params)
+//---------------------------------------------------------------------
+// Debug menu loop for adjusting GPU/display settings.
+//---------------------------------------------------------------------
+void Debug(configured_features *params)
 {
 	int done = 0;
-	int debug_sel = 0; 
-	SceCtrlData pad, oldPad;
-
+	SceCtrlData pad, oldPad = {0};
 	pspDebugScreenSetXY(0, 0);
-	selposDebug = totalconfig;
+	selposDebug = totalSettings; // Start at first debug setting
 
-	//for (cnt=0;cnt<100;cnt++)//pspDebugScreenPrintf("\n");
-	while (!done) {
+	while (!done)
+	{
 		sceDisplayWaitVblankStart();
 		pspDebugScreenSetTextColor(0xffffffff);
 		pspDebugScreenSetXY(0, 3);
-		pspDebugScreenPrintf("\n");
-		pspDebugScreenPrintf("\n");
-		pspDebugScreenPrintf("  Debug:\n\n");
-		pspDebugScreenPrintf("  Disable Rendering: BG0 - BG1 - BG2 - BG3 - OBJ\n");
-		pspDebugScreenPrintf("\n");
-		pspDebugScreenPrintf("\n");
+		pspDebugScreenPrintf("\n\n  Debug:\n\n  Disable Rendering: BG0 - BG1 - BG2 - BG3 - OBJ\n\n\n");
 
 		ChangeValueDebug(params);
 		DisplayDebugParms();
-	
+
 		if (sceCtrlPeekBufferPositive(&pad, 1))
 		{
 			if (pad.Buttons != oldPad.Buttons)
 			{
 				if (pad.Buttons & PSP_CTRL_LEFT)
+					settings[selposDebug].value = 0;
+				else if (pad.Buttons & PSP_CTRL_RIGHT)
 				{
-					configparms[selposDebug].var = 0;
-				}
-				else if (pad.Buttons & PSP_CTRL_RIGHT) {
-					configparms[selposDebug].var = 1;
+					settings[selposDebug].value = 1;
 					changed = true;
 				}
-				if (pad.Buttons & PSP_CTRL_START) {
+				if (pad.Buttons & PSP_CTRL_START)
+				{
 					pspDebugScreenSetTextColor(0xffffffff);
 					done = 1;
 					return;
 				}
-				if (pad.Buttons & PSP_CTRL_UP) {
+				if (pad.Buttons & PSP_CTRL_UP)
+				{
 					selposDebug--;
-					if (selposDebug < totalconfig)selposDebug = totalconfig;
+					if (selposDebug < totalSettings)
+						selposDebug = totalSettings;
 				}
-				if (pad.Buttons & PSP_CTRL_DOWN) {
+				if (pad.Buttons & PSP_CTRL_DOWN)
+				{
 					selposDebug++;
-					if (selposDebug >= totalconfigDebug - 1)selposDebug = totalconfigDebug - 1;
+					if (selposDebug >= totalSettingsDebug - 1)
+						selposDebug = totalSettingsDebug - 1;
 				}
-
 			}
 			oldPad = pad;
 		}
-
 	}
-
 	pspDebugScreenSetTextColor(0xffffffff);
-
 }
 
-void DoConfig(configured_features * params)
+//---------------------------------------------------------------------
+// Per-ROM settings persistence.
+//
+// Each ROM gets its own config file under CONFIG/<rombase>.cfg, storing the
+// menu settings as "name=value" lines. Saving/loading by NAME (not by index or
+// by dumping the struct) keeps old config files compatible when settings are
+// added, removed, or reordered. Files live next to the executable.
+//---------------------------------------------------------------------
+
+// Extract the bare ROM file name (no directory, no extension) from a full path.
+static void RomBaseName(const char *romPath, char *out, size_t outSize)
+{
+	const char *slash = strrchr(romPath, '/');
+	const char *name  = slash ? slash + 1 : romPath;
+	strncpy(out, name, outSize - 1);
+	out[outSize - 1] = '\0';
+	char *dot = strrchr(out, '.');
+	if (dot) *dot = '\0';
+}
+
+// Build "<cwd>/CONFIG/<rombase>.cfg" and ensure the CONFIG directory exists.
+static void RomConfigPath(const char *romPath, char *out, size_t outSize)
+{
+	char app_path[160];
+	getcwd(app_path, sizeof(app_path));
+
+	char dir[256];
+	snprintf(dir, sizeof(dir), "%s/CONFIG", app_path);
+	sceIoMkdir(dir, 0777);   // no-op if it already exists
+
+	char base[128];
+	RomBaseName(romPath, base, sizeof(base));
+	snprintf(out, outSize, "%s/%s.cfg", dir, base);
+}
+
+// Save the current menu settings[] to the ROM's config file.
+void SaveRomConfig(const char *romPath)
+{
+	if (!romPath || !romPath[0]) return;
+
+	char cfgPath[300];
+	RomConfigPath(romPath, cfgPath, sizeof(cfgPath));
+
+	FILE *f = fopen(cfgPath, "w");
+	if (!f) return;
+	for (int i = 0; i < totalSettings; i++)
+		fprintf(f, "%s=%d\n", settings[i].name, settings[i].value);
+	for (int i = 0; i < totalExp; i++)
+		fprintf(f, "%s=%d\n", expSettings[i].name, expSettings[i].value);
+	fclose(f);
+}
+
+// Load saved values into settings[] (matched by name). Settings absent from the
+// file keep the defaults already placed by InitMainSettings. Returns true if a
+// config file was found.
+bool LoadRomConfig(const char *romPath)
+{
+	if (!romPath || !romPath[0]) return false;
+
+	char cfgPath[300];
+	RomConfigPath(romPath, cfgPath, sizeof(cfgPath));
+
+	FILE *f = fopen(cfgPath, "r");
+	if (!f) return false;
+
+	char line[160];
+	while (fgets(line, sizeof(line), f))
+	{
+		char *eq = strchr(line, '=');
+		if (!eq) continue;
+		*eq = '\0';
+		const char *key = line;
+		int val = atoi(eq + 1);
+		bool matched = false;
+		for (int i = 0; i < totalSettings; i++)
+			if (strcmp(settings[i].name, key) == 0) { settings[i].value = val; matched = true; break; }
+		if (!matched)
+			for (int i = 0; i < totalExp; i++)
+				if (strcmp(expSettings[i].name, key) == 0) { expSettings[i].value = val; break; }
+	}
+	fclose(f);
+	return true;
+}
+
+//---------------------------------------------------------------------
+// Main configuration menu loop. Special handling is provided for the
+// "Language" (displayed as text) and "Frameskip" settings.
+//---------------------------------------------------------------------
+void DoConfig(configured_features *params)
 {
 	int done = 0;
-	SceCtrlData pad, oldPad;
+	SceCtrlData pad, oldPad = {0};
 
 	pspDebugScreenSetXY(0, 0);
-
+/*
 #ifdef LOWRAM
-	configparms[5].var = 1;
-	configparms[6].var = 1;
+	settings[5].value = 1;
+	settings[6].value = 1;
 #else
-	configparms[6].var = 1;
+	settings[1].value = 1;
+	settings[2].value = 1;
+	settings[4].value = 1;
+	settings[6].value = 1;
+	settings[8].value = 1;
+#endif
+*/
+	int langposconfig = 0;
+	int frameposconfig = 0;
 
-	//configparms[7].var = 1;
-#endif // LOWRAM
+	InitMainSettings(params);
 
-	configparms[7].var = 1;
+	// Load this ROM's saved settings over the defaults (matched by name).
+	extern char rom_filename[256];
+	LoadRomConfig(rom_filename);
 
-	
-
-	int cnt;
-	//for (cnt=0;cnt<100;cnt++)//pspDebugScreenPrintf("\n");
-	while (!done) {
+	while (!done)
+	{
 		sceDisplayWaitVblankStart();
+		pspDebugScreenSetXY(5, 2);
+		pspDebugScreenSetTextColor(0xff00ff00);
+		pspDebugScreenPrintf("[ Emulator Settings ]\n");
 		pspDebugScreenSetTextColor(0xffffffff);
-		pspDebugScreenSetXY(0, 3);
-		pspDebugScreenPrintf("\n");
-		pspDebugScreenPrintf("\n");
-		pspDebugScreenPrintf("  Config Menu:\n\n");
-		pspDebugScreenPrintf("  Lang config: 0 = JAP, 1 = ENG, 2 = FRE, 3 = GER,\n");
-		pspDebugScreenPrintf("  4 = ITA, 5 = SPA, 6 = CHI, 7 = RES\n\n");
-		pspDebugScreenPrintf("  Hide Screen: 1 = Bottom, 2 = Top   \n\n");
-		pspDebugScreenPrintf("\n");
-		pspDebugScreenPrintf("\n");
-		InitConfigParms(params);
+
 		DisplayConfigParms();
+
 		if (sceCtrlPeekBufferPositive(&pad, 1))
 		{
 			if (pad.Buttons != oldPad.Buttons)
 			{
-				if (pad.Buttons & PSP_CTRL_LEFT)
+				switch (pad.Buttons)
 				{
-					if (strcmp(configparms[selposconfig].name, "Language") == 0)
-					{
-						configparms[selposconfig].var = langposconfig--;
-						if (langposconfig == -1)langposconfig = 0;
-					}
-					else
-						if (strcmp(configparms[selposconfig].name, "3D Frameskip") == 0)
+					case PSP_CTRL_LEFT:
+						if (strcmp(settings[selposconfig].name, "Language") == 0)
 						{
-							configparms[selposconfig].var = frameposconfig--;
-							if (frameposconfig == -1)frameposconfig = 0;
+							settings[selposconfig].value = std::max(0, (settings[selposconfig].value - 1) % 8);
 						}
-						else
-						if (strcmp(configparms[selposconfig].name, "Hide screen") == 0)
+						else if (strcmp(settings[selposconfig].name, "Frameskip") == 0)
 						{
-							configparms[selposconfig].var = (screenpos--);
-							if (screenpos < 0) screenpos = 0;
+							settings[selposconfig].value = std::max(0, (settings[selposconfig].value - 1) % 10);
 						}
-						else
-						if (strcmp(configparms[selposconfig].name, "Dynarec block size") == 0)
+						else if (strcmp(settings[selposconfig].name, "FPS Cap") == 0)
 						{
-							configparms[selposconfig].var = (DBLSZ--);
-							if (DBLSZ < 1) DBLSZ = 1;
-						}
-						else
-						if (strcmp(configparms[selposconfig].name, "Vcount ME start") == 0)
-						{
-							configparms[selposconfig].var = (VcounTT--);
-							if (VcounTT < 0) VcounTT = 0;
+							settings[selposconfig].value = std::max(0, (settings[selposconfig].value - 1) % 6);
 						}
 						else
 						{
-							configparms[selposconfig].var = 0;
+							settings[selposconfig].value = 0;
 						}
-				}
-				else
-					if (pad.Buttons & PSP_CTRL_RIGHT) {
-						if (strcmp(configparms[selposconfig].name, "Language") == 0)
-						{
-							configparms[selposconfig].var = langposconfig++;
-							if (langposconfig == 8)langposconfig = 7;
-						}
-						else
-							if (strcmp(configparms[selposconfig].name, "3D Frameskip") == 0)
-							{
-								configparms[selposconfig].var = frameposconfig++;
-								if (frameposconfig == 10)frameposconfig = 9;
-							}
-							else
-							if (strcmp(configparms[selposconfig].name, "Hide screen") == 0)
-							{
-								configparms[selposconfig].var = (screenpos++);
-								if (screenpos > 2) screenpos = 2;
-							}
-							else
-							if (strcmp(configparms[selposconfig].name, "Dynarec block size") == 0)
-							{
-								configparms[selposconfig].var = (DBLSZ++);
-								if (DBLSZ > 100) DBLSZ = 100;
-							}else
-							if (strcmp(configparms[selposconfig].name, "Vcount ME start") == 0)
-							{
-								configparms[selposconfig].var = (VcounTT++);
-								if (VcounTT > 262) VcounTT = 262;
-							}
-							else
-							{
-								configparms[selposconfig].var = 1;
-							}
+					break;
 
-					}
-				if (pad.Buttons & PSP_CTRL_START) {
-					done = 1;//delay
+					case PSP_CTRL_RIGHT:
+						if (strcmp(settings[selposconfig].name, "Language") == 0)
+						{
+							settings[selposconfig].value = (settings[selposconfig].value + 1) % 8;
+						}
+						else if (strcmp(settings[selposconfig].name, "Frameskip") == 0)
+						{
+							settings[selposconfig].value = (settings[selposconfig].value + 1) % 10;
+						}
+						else if (strcmp(settings[selposconfig].name, "FPS Cap") == 0)
+						{
+							settings[selposconfig].value = (settings[selposconfig].value + 1) % 6;
+						}
+						else
+						{
+							settings[selposconfig].value = 1;
+						}
+					break;
+
+					case PSP_CTRL_START:
+						done = 1;
+					break;
+
+					case PSP_CTRL_UP:
+						selposconfig = ((unsigned int)(selposconfig - 1)) % totalSettings;
+					break;
+
+					case PSP_CTRL_DOWN:
+						selposconfig = ((unsigned int)(selposconfig + 1)) % totalSettings;
+					break;
+				
+				default:
 					break;
 				}
-				/*if (pad.Buttons & PSP_CTRL_SELECT && pad.Buttons & PSP_CTRL_UP) {
-				//#ifdef DEB
-					Debug(params);
-				//#endif
-				}*/
-				
-				if (pad.Buttons & PSP_CTRL_UP) {
-					selposconfig--;
-					if (selposconfig < 0)selposconfig = 0;
-				}
-				if (pad.Buttons & PSP_CTRL_DOWN) {
-					selposconfig++;
-					if (selposconfig >= totalconfig - 1)selposconfig = totalconfig - 1;
-				}
-
 			}
 			oldPad = pad;
 		}
-
 	}
-
 	pspDebugScreenSetTextColor(0xffffffff);
+	FinalizeMainSettings(params);
 
+	// Persist the chosen settings for this ROM.
+	SaveRomConfig(rom_filename);
 }
 
-//5SM2SF
-
-
-
+//---------------------------------------------------------------------
+// File Browser functions (unchanged)
+//---------------------------------------------------------------------
 
 f_list filelist;
 
-void ClearFileList(){
-	filelist.cnt =0;
-	filelist.dir_cnt =0;
-}
-
-
-int HasExtension(char *filename){
-	if(filename[strlen(filename)-4] == '.'){
-		return 1;
-	}
-	return 0;
-}
-
-
-void GetExtension(const char *srcfile,char *outext){
-	if(HasExtension((char *)srcfile)){
-		strcpy(outext,srcfile + strlen(srcfile) - 3);
-	}else{
-		strcpy(outext,"");
-	}
-}
-
-enum {
-	EXT_NDS = 1,
-	EXT_GZ = 2,
-	EXT_ZIP = 4,
-	EXT_UNKNOWN = 8,
-};
-
-const struct {
-	char *szExt;
-	int nExtId;
-} stExtentions[] = {
-	{"nds",EXT_NDS},
-//	{"gz",EXT_GZ},
-//	{"zip",EXT_ZIP},
-	{NULL, EXT_UNKNOWN}
-};
-
-int getExtId(const char *szFilePath) {
-	char *pszExt;
-
-	if ((pszExt = strrchr(szFilePath, '.'))) {
-		pszExt++;
-		int i;
-		for (i = 0; stExtentions[i].nExtId != EXT_UNKNOWN; i++) {
-			if (!strcasecmp(stExtentions[i].szExt,pszExt)) {
-				return stExtentions[i].nExtId;
-			}
-		}
-	}
-
-	return EXT_UNKNOWN;
-}
-
-void GetFileList(const char *root)
+void ClearFileList()
 {
-	int dfd;
-	dfd = sceIoDopen(root);
-	if(dfd > 0){
-		SceIoDirent dir;
-		while(sceIoDread(dfd, &dir) > 0)
-		{
-			if(dir.d_stat.st_attr & FIO_SO_IFDIR)
-			{
-				//strcpy(filelist.dir[filelist.dir_cnt++].name,dir.d_name);
-			}
-			else
-			{				
-				if(getExtId(dir.d_name)!= EXT_UNKNOWN){
-				strcpy(filelist.fname[filelist.cnt].name,dir.d_name);
-				filelist.cnt++;
-				}
-			
-			}
-		}
-		sceIoDclose(dfd);
-	}
+	filelist.cnt = 0;
+	filelist.dir_cnt = 0;
 }
-//#include "RomIcon.h"
 
-void GetPrevDir(char * path){
-	int index = strlen(path) -1;
-	for (;path[--index] != '/' && index > 4 ;);
+#include <iostream>
+#include <unordered_map>
+#include <string_view>
+#include <algorithm>
+#include <cctype>
+#include <array>
+
+// File system includes for PSP (if required)
+#include <pspiofilemgr.h>  
+
+enum ExtId {
+    EXT_NDS,
+    EXT_GZ,
+    EXT_ZIP,
+    EXT_UNKNOWN
+};
+
+constexpr std::array extensions{
+    std::pair<std::string_view, ExtId>{"nds", EXT_NDS},
+    // {"gz", EXT_GZ},
+    // {"zip", EXT_ZIP},
+};
+
+bool iequals(std::string_view a, std::string_view b) {
+    return std::ranges::equal(a, b, [](char c1, char c2) {
+        return std::tolower(c1) == std::tolower(c2);
+    });
+}
+
+ExtId getExtId(std::string_view filePath) {
+    auto pos = filePath.rfind('.');
+    if (pos == std::string_view::npos || pos + 1 == filePath.size()) {
+        return EXT_UNKNOWN; // No extension or empty extension
+    }
+
+    std::string_view ext = filePath.substr(pos + 1);
+    for (const auto& [key, value] : extensions) {
+        if (iequals(key, ext)) {
+            return value;
+        }
+    }
+    return EXT_UNKNOWN;
+}
+
+
+// Max entries the fixed-size filelist arrays (f_name fname[256]) can hold.
+#define FILELIST_MAX 256
+
+void GetFileList(const char *root) {
+    // Standard C dirent instead of sceIo* — more portable and well-behaved on
+    // hosts like PPSSPP. Filters by extension; ignores anything we can't read.
+    DIR *d = opendir(root);
+    if (!d) return;
+
+    struct dirent *ent;
+    while ((ent = readdir(d)) != NULL) {
+        // Bound check: writing past fname[256] smashes adjacent globals → crash.
+        if (filelist.cnt >= FILELIST_MAX) break;
+        if (ent->d_name[0] == '.') continue;            // skip "." / ".."
+        if (getExtId(ent->d_name) == EXT_UNKNOWN) continue;
+        strncpy(filelist.fname[filelist.cnt].name, ent->d_name,
+                sizeof(filelist.fname[filelist.cnt].name) - 1);
+        filelist.fname[filelist.cnt].name[sizeof(filelist.fname[filelist.cnt].name) - 1] = '\0';
+        filelist.cnt++;
+    }
+    closedir(d);
+}
+
+
+
+
+void GetPrevDir(char *path)
+{
+	int index = strlen(path) - 1;
+	for (; path[--index] != '/' && index > 4;)
+		;
 	path[index] = 0;
 }
 
-int selpos=0, oldpos = -1, oldpage = 0, ndir = 0;
-void DisplayFileList(char* root)
+int selpos = 0, oldpos = -1, oldpage = 0, ndir = 0;
+void DisplayFileList(char *root)
 {
-
 	DrawRom(root, &filelist, selpos, true);
 	return;
-
-	static const int MAX_ROM = filelist.cnt;
-	static const int ROM_SHOWN = 20;
-
-	const int CURR_PAGE = (selpos / ROM_SHOWN);
-
-	//const int HOW_MANY = (MAX_ROM - (CURR_PAGE * 15));
-
-	const int index = CURR_PAGE * ROM_SHOWN;
-
-	if (selpos == oldpos) return;
-
-	//printf("Curr page: %d, index: %d \n", CURR_PAGE,index);
-
-	//pspDebugScreenClear();
-	//DrawRom(root, &filelist, selpos, true);
-
-	bool max_reached = false;
-
-	oldpos = selpos;
-	
-	/*if (oldpage != CURR_PAGE)
-		pspDebugScreenClear();
-
-	oldpage = CURR_PAGE;*/
-
-
-	if (CURR_PAGE > 0)
-		pspDebugScreenPrintf("\nBack\n");
-	else 
-		pspDebugScreenPrintf("\n\n");
-
-	for (int c = index ;c < index + ROM_SHOWN;c++) {
-
-		if (c >= MAX_ROM) {
-			pspDebugScreenPrintf("\n");
-			max_reached = true;
-			continue;
-		}
-
-		if (selpos == c) {
-			pspDebugScreenSetTextColor(0x0000ffff);
-		}
-		else {
-			pspDebugScreenSetTextColor(0xffffffff);
-		}
-
-		pspDebugScreenPrintf("\n%s", filelist.fname[c].name);
-	}
-
-	pspDebugScreenSetTextColor(0xffffffff);
-
-	if(!max_reached)
-		pspDebugScreenPrintf("\n\nNext Page");
-	else
-		pspDebugScreenPrintf("\n\n\n");
 }
 
-void DSEmuGui(char *path,char *out)
+// Load the settings[] for the ROM at the given list index, so the split-screen
+// settings panel always reflects the highlighted game (defaults + saved file).
+static void LoadSettingsForRom(const char *romsDir, int idx)
+{
+	if (idx < 0 || idx >= filelist.cnt) return;
+	InitMainSettings(&my_config);   // defaults into settings[]
+	InitExperimentalSettings(&my_config); // defaults into expSettings[]
+	char full[300];
+	snprintf(full, sizeof(full), "%s/%s", romsDir, filelist.fname[idx].name);
+	LoadRomConfig(full);            // overlay saved values (matched by name)
+	FinalizeExperimental(&my_config); // apply loaded experimental flags to globals
+}
+
+// Adjust the focused setting left/right, mirroring the DoConfig step logic.
+static void StepSetting(int dir)  // dir = -1 or +1
+{
+	const char *name = settings[menu_setSel].name;
+	int *v = &settings[menu_setSel].value;
+	if (strcmp(name, "Language") == 0)
+		*v = (*v + dir + 8) % 8;
+	else if (strcmp(name, "Frameskip") == 0)
+		*v = (*v + dir + 10) % 10;
+	else if (strcmp(name, "FPS Cap") == 0)
+		*v = (*v + dir + 6) % 6;
+	else
+		*v = (dir > 0) ? 1 : 0;   // boolean toggles
+}
+
+void DSEmuGui(char *path, char *out)
 {
 	char tmp[256];
 	char app_path[128];
+	SceCtrlData pad, oldPad = {0};
 
-	SceCtrlData pad,oldPad;
-	
 	ClearFileList();
-
-	getcwd(app_path,128);
-
-	sprintf(tmp,"%s/ROMS/",app_path);
-
+	getcwd(app_path, 128);
+	sprintf(tmp, "%s/ROMS/", app_path);
 	GetFileList(tmp);
 
-	while(1){
-		sceDisplayWaitVblankStart();
-		pspDebugScreenSetXY(0, 3);
-		DisplayFileList(tmp);
-		if(sceCtrlPeekBufferPositive(&pad, 1))
-		{
-			if (pad.Buttons != oldPad.Buttons)
-			{
-				oldPad = pad;
+	// ROMS dir without the trailing slash, for per-ROM config paths.
+	char romsDir[256];
+	snprintf(romsDir, sizeof(romsDir), "%s/ROMS", app_path);
 
-				if(pad.Buttons & PSP_CTRL_SQUARE){
-			      sceKernelExitGame();
-				}
+	menu_romSel = 0;
+	menu_setSel = 0;
+	menu_focusRight = false;
+	int lastLoadedRom = -1;
 
-				if(pad.Buttons & PSP_CTRL_CROSS)
-				{
-					/*if (selpos < ndir){
-
-						pspDebugScreenClear();
-
-						if (selpos < 2) GetPrevDir(tmp);
-						else {
-							strcat(tmp,"/");
-							strcat(tmp,filelist.dir[selpos].name);
-						}
-
-						ClearFileList();
-						GetFileList(tmp);
-						oldpos = -1;
-						selpos = 0;
-						continue;
-					}*/
-
-					SetupDisp_EMU();
-					sprintf(out,"%s/%s",tmp,filelist.fname[selpos].name);	
-					printf("ROM2: %s\n", out);
-					break;
-				}
-			
-				if(pad.Buttons & PSP_CTRL_UP){
-					//selpos--;
-					selpos -= 3;
-					if(selpos < 0)selpos=0;
-				}else 
-				if(pad.Buttons & PSP_CTRL_DOWN){
-					//selpos++;
-					selpos += 3;
-					if(selpos >= filelist.cnt) selpos=filelist.cnt-1;
-				}else
-				if (pad.Buttons & PSP_CTRL_LEFT) {
-					selpos --;
-					if(selpos < 0)selpos=0;
-				}else
-				if (pad.Buttons & PSP_CTRL_RIGHT) {
-					selpos++;
-					if(selpos >= filelist.cnt -1)selpos=filelist.cnt-1;
-				}
-
-			}
+	while (1)
+	{
+		// Keep the settings panel in sync with the highlighted ROM.
+		if (menu_romSel != lastLoadedRom) {
+			LoadSettingsForRom(romsDir, menu_romSel);
+			lastLoadedRom = menu_romSel;
 		}
 
+		sceDisplayWaitVblankStart();
+		DrawRomMenu(tmp, &filelist, filelist.cnt);
+
+		if (sceCtrlPeekBufferPositive(&pad, 1) && pad.Buttons != oldPad.Buttons)
+		{
+			oldPad = pad;
+
+			if (pad.Buttons & PSP_CTRL_HOME)
+				sceKernelExitGame();
+
+			// L / R toggle focus between the two panels.
+			if (pad.Buttons & (PSP_CTRL_LTRIGGER | PSP_CTRL_RTRIGGER))
+				menu_focusRight = !menu_focusRight;
+
+			if (pad.Buttons & PSP_CTRL_TRIANGLE)
+			{
+				pspDebugScreenClear();
+				pspDebugScreenSetXY(0, 0);
+				jit_difftest_run_force();
+				pspDebugScreenPrintf("\n  Press X to return.\n");
+				SceCtrlData wpad;
+				do { sceCtrlPeekBufferPositive(&wpad, 1); sceKernelDelayThread(50000); }
+				while (!(wpad.Buttons & PSP_CTRL_CROSS));
+				pspDebugScreenClear();
+				oldPad = wpad;
+				continue;
+			}
+
+			if (pad.Buttons & PSP_CTRL_CROSS)
+			{
+				// Persist the edited settings for this ROM, then launch it.
+				snprintf(out, 256, "%s/%s", tmp, filelist.fname[menu_romSel].name);
+				FinalizeMainSettings(&my_config);
+				FinalizeExperimental(&my_config);
+				char full[300];
+				snprintf(full, sizeof(full), "%s/%s", romsDir,
+				         filelist.fname[menu_romSel].name);
+				SaveRomConfig(full);
+				break;
+			}
+
+			if (menu_focusRight)
+			{
+				// Settings panel: Up/Down move, Left/Right change value.
+				if (pad.Buttons & PSP_CTRL_UP)
+					menu_setSel = (menu_setSel - 1 + totalSettings) % totalSettings;
+				else if (pad.Buttons & PSP_CTRL_DOWN)
+					menu_setSel = (menu_setSel + 1) % totalSettings;
+				else if (pad.Buttons & PSP_CTRL_LEFT)
+					StepSetting(-1);
+				else if (pad.Buttons & PSP_CTRL_RIGHT)
+					StepSetting(+1);
+			}
+			else
+			{
+				// ROM list panel: Up/Down by 1, Left/Right by a page of 8.
+				if (pad.Buttons & PSP_CTRL_UP)              menu_romSel -= 1;
+				else if (pad.Buttons & PSP_CTRL_DOWN)       menu_romSel += 1;
+				else if (pad.Buttons & PSP_CTRL_LEFT)       menu_romSel -= 8;
+				else if (pad.Buttons & PSP_CTRL_RIGHT)      menu_romSel += 8;
+				if (menu_romSel < 0)               menu_romSel = 0;
+				if (menu_romSel >= filelist.cnt)   menu_romSel = filelist.cnt - 1;
+			}
+		}
 	}
 }
 
+// In-game ROM settings editor. Reached from the pause menu; edits settings[]
+// for the running ROM, applies them live and persists them on exit.
+void RomSettingsMenu()
+{
+	extern char rom_filename[256];
+	extern bool NDS_3D_ChangeCore(int newCore);
+	extern void backup_setManualBackupType(int type);
+	extern void arm_jit_reset(bool enable, bool suppress_msg);
+
+	SceCtrlData pad, oldPad = {0};
+	if (menu_setSel < 0 || menu_setSel >= totalSettings)
+		menu_setSel = 0;
+	if (totalExp == 0)
+		InitExperimentalSettings(&my_config);
+
+	int tab    = 0;        // 0 = ROM settings, 1 = Experimental
+	int expSel = 0;
+
+	// Snapshot the runtime-relevant experimental flags to detect changes that
+	// require a JIT recompile on exit. (Index 2 = Cycles In Register is
+	// compile-time only, so it is excluded.)
+	int expBefore[MAX_EXP_SETTINGS];
+	for (int i = 0; i < totalExp; i++) expBefore[i] = expSettings[i].value;
+
+	// This menu is opened by pressing X in the pause menu; that same X press is
+	// still held when we get here and would instantly trigger the X (save & exit)
+	// case below. Wait for the button to be released first (with a small delay)
+	// so the screen is actually accessible.
+	sceKernelDelayThread(150000); // 150 ms
+	do {
+		sceCtrlPeekBufferPositive(&pad, 1);
+		sceKernelDelayThread(20000);
+	} while (pad.Buttons & PSP_CTRL_CROSS);
+	oldPad = pad;
+
+	while (1)
+	{
+		sceDisplayWaitVblankStart();
+		DrawRomSettings(tab ? expSel : menu_setSel, tab);
+
+		if (sceCtrlPeekBufferPositive(&pad, 1) && pad.Buttons != oldPad.Buttons)
+		{
+			oldPad = pad;
+
+			if (pad.Buttons & (PSP_CTRL_LTRIGGER | PSP_CTRL_RTRIGGER))
+			{
+				tab ^= 1;
+			}
+			else if (pad.Buttons & (PSP_CTRL_CROSS | PSP_CTRL_CIRCLE))
+				break;
+			else if (tab == 0)
+			{
+				if (pad.Buttons & PSP_CTRL_UP)
+					menu_setSel = (menu_setSel - 1 + totalSettings) % totalSettings;
+				else if (pad.Buttons & PSP_CTRL_DOWN)
+					menu_setSel = (menu_setSel + 1) % totalSettings;
+				else if (pad.Buttons & PSP_CTRL_LEFT)
+					StepSetting(-1);
+				else if (pad.Buttons & PSP_CTRL_RIGHT)
+					StepSetting(+1);
+			}
+			else // Experimental tab (all boolean toggles)
+			{
+				if (pad.Buttons & PSP_CTRL_UP)
+					expSel = (expSel - 1 + totalExp) % totalExp;
+				else if (pad.Buttons & PSP_CTRL_DOWN)
+					expSel = (expSel + 1) % totalExp;
+				else if (pad.Buttons & PSP_CTRL_LEFT)
+					expSettings[expSel].value = 0;
+				else if (pad.Buttons & PSP_CTRL_RIGHT)
+					expSettings[expSel].value = 1;
+			}
+		}
+	}
+
+	// Apply the edited values live and persist them for this ROM. Most fields
+	// (frameskip, fps cap, showfps, screen swap) are read every frame from
+	// my_config, so they take effect immediately. The 3D core and backup type
+	// need an explicit re-apply, matching EMU_Conf().
+	FinalizeMainSettings(&my_config);
+	FinalizeExperimental(&my_config);
+	NDS_3D_ChangeCore(my_config.Render3D);
+	backup_setManualBackupType(my_config.savetype);
+	SaveRomConfig(rom_filename);
+
+	// Any runtime opt change alters emitted code: recompile blocks. Index 2
+	// (Cycles In Register) is compile-time and never differs at runtime.
+	bool needReset = false;
+	for (int i = 0; i < totalExp; i++)
+		if (i != 2 && expSettings[i].value != expBefore[i]) needReset = true;
+	if (needReset)
+		arm_jit_reset(true, true);
+}

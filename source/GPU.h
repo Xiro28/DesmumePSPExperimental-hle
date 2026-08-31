@@ -35,7 +35,9 @@ struct MMU_struct;
 void gpu_savestate(EMUFILE* os);
 bool gpu_loadstate(EMUFILE* is, int size);
 
-extern volatile u8 __attribute__((aligned(64))) GPU_Screen[192 * 256 * 4];
+//extern volatile u8 __attribute__((aligned(64))) GPU_Screen[192 * 256 * 4];
+extern volatile u8 __attribute__((aligned(16))) *GPU_Screen;
+extern volatile u8 __attribute__((aligned(16))) *GPU_Screen_extra;
 
 /*******************************************************************************
     this structure is for display control,
@@ -512,6 +514,16 @@ enum GPU_OBJ_MODE
 	GPU_OBJ_MODE_Bitmap = 3
 };
 
+enum GPULayerID
+{
+	GPULayerID_BG0					= 0,
+	GPULayerID_BG1					= 1,
+	GPULayerID_BG2					= 2,
+	GPULayerID_BG3					= 3,
+	GPULayerID_OBJ					= 4,
+	GPULayerID_Backdrop				= 5
+};
+
 typedef union
 {
 	u16 attr[4];
@@ -675,7 +687,7 @@ struct GPU
 	_BGxCNT & bgcnt(int num) { return (dispx_st)->dispx_BGxCNT[num].bits; }
 	_DISPCNT & dispCnt() { return dispx_st->dispx_DISPCNT.bits; }
 
-	template<bool MOSAIC> void modeRender(int layer);
+	template<bool MOSAIC> void modeRender(const GPULayerID layer);
 
 	DISPCAPCNT dispCapCnt;
 	BOOL LayersEnable[5];
@@ -804,7 +816,7 @@ struct GPU
 	u16 blend(u16 colA, u16 colB);
 
 	template<bool BACKDROP, BlendFunc FUNC, bool WINDOW>
-	FORCEINLINE FASTCALL bool _master_setFinalBGColor(u16 &color, const u32 x);
+	FORCEINLINE FASTCALL constexpr bool _master_setFinalBGColor(u16 &color, const u32 x);
 
 	template<BlendFunc FUNC, bool WINDOW>
 	FORCEINLINE FASTCALL void _master_setFinal3dColor(int dstX, int srcX);
@@ -845,7 +857,7 @@ struct GPU
 	
 	template<bool BACKDROP, int FUNCNUM> void setFinalColorBG(u16 color, const u32 x);
 	template<bool MOSAIC, bool BACKDROP> FORCEINLINE void __setFinalColorBck(u16 color, const u32 x, const int opaque);
-	template<bool MOSAIC, bool BACKDROP, int FUNCNUM> FORCEINLINE void ___setFinalColorBck(u16 color, const u32 x, const int opaque);
+	template<const bool MOSAIC, const bool BACKDROP, const int FUNCNUM, const bool opaque> FORCEINLINE void ___setFinalColorBck(u16 color, const u32 x);
 
 	void setAffineStart(int layer, int xy, u32 val);
 	void setAffineStartWord(int layer, int xy, u16 val, int word);
@@ -945,7 +957,7 @@ int Screen_Init();
 void Screen_Reset(void);
 void Screen_DeInit(void);
 
-extern MMU_struct MMU;
+extern MMU_struct MMU;  // baseline declares the object, not a reference
 
 void GPU_setVideoProp(GPU *, u32 p);
 void GPU_setBGProp(GPU *, u16 num, u16 p);

@@ -25,7 +25,6 @@
 
 #include "types.h"
 #include "PSP/FrontEnd.h"
-#include "pspvfpu.h"
 
 class EMUFILE;
 
@@ -278,6 +277,8 @@ struct POLY {
 	u32 polyAttr, texParam, texPalette; //the hardware rendering params
 	bool backfacing;
 	u32 viewport;
+	u16 mtxId; // index into the per-frame modelview matrix pool (gfx3d)
+	u16 projId; // index into the per-frame projection matrix pool (GU HW transform)
 	float miny, maxy;
 	float minz, maxz;
 
@@ -507,7 +508,7 @@ struct POLY {
 #ifdef LOWRAM
 #define POLYLIST_SIZE 1500
 #else
-#define POLYLIST_SIZE 9000
+#define POLYLIST_SIZE 8096
 #endif // LOWRAM
 
 
@@ -537,6 +538,13 @@ struct VERT_POS4f
 	}
 };
 
+enum PolygonType
+{
+	POLYGON_TYPE_UNDEFINED		= 0,
+	POLYGON_TYPE_TRIANGLE		= 3,
+	POLYGON_TYPE_QUAD			= 4
+};
+
 //dont use SSE optimized matrix instructions in here, things might not be aligned
 //we havent padded this because the sheer bulk of data leaves things running faster without the extra bloat
 struct VERT {
@@ -547,6 +555,11 @@ struct VERT {
 			float x,y,z,w;
 		};
 	} CACHE_ALIGN;
+	// Raw object-space coords (pre-modelview). Saved so the PSP GU can do the
+	// modelview*projection transform in hardware (GU_TRANSFORM_3D) instead of us
+	// pre-multiplying on the CPU. coord[] above stays the CPU-transformed value
+	// (still used by lighting / line-segment detection / clip checks).
+	float rawcoord[4] CACHE_ALIGN;
 	union {
 		float texcoord[2];
 		struct {
@@ -556,6 +569,7 @@ struct VERT {
 
 	u8 color[4];
 	float fcolor[4];
+	//bool converted;
 
 	void set_coord(float x, float y, float z, float w) { 
 		this->x = x; 
@@ -584,7 +598,8 @@ struct VERT {
 #ifdef LOWRAM
 #define VERTLIST_SIZE 3000
 #else
-#define VERTLIST_SIZE 36000
+#define VERTLIST_SIZE (POLYLIST_SIZE * 4)
+#define INDEXLIST_SIZE (POLYLIST_SIZE * 4)
 #endif
 
 struct VERTLIST {
@@ -593,7 +608,7 @@ struct VERTLIST {
 };
 
 struct INDEXLIST {
-	int list[POLYLIST_SIZE];
+	int list[INDEXLIST_SIZE];
 };
 
 
@@ -603,13 +618,11 @@ struct VIEWPORT {
 };
 
 //PSP GU
-struct Vertex
-{
-	//u16 color;
-	float u, v;
-	unsigned int col;
-	float x, y, z;
-};
+struct Vertex {
+    float u, v;      // texture coords
+    u32   col;       // 0xAABBGGRR  ← GU usa ABGR, non ARGB/RGBA!
+    float x, y, z;
+} __attribute__((packed, aligned(4)));
 
 //ok, imagine the plane that cuts diagonally across a cube such that it clips
 //out to be a hexagon. within that plane, draw a quad such that it cuts off
@@ -738,6 +751,10 @@ struct GFX3D
 	//values used for the currently-rendered frame (committed with each flush)
 	GFX3D_State renderState;
 
+	POLYLIST* processed_polylist;
+	VERTLIST* processed_vertlist;
+	INDEXLIST processed_indexlist;
+
 	POLYLIST* polylist;
 	VERTLIST* vertlist;
 	INDEXLIST indexlist;
@@ -747,6 +764,22 @@ extern GFX3D gfx3d;
 //---------------------
 
 extern CACHE_ALIGN float mtxCurrent[4][16];
+
+// Per-frame modelview matrix pool (PSP GU hardware-transform path). See gfx3d.cpp.
+#define MTXPOOL_SIZE 1024
+extern CACHE_ALIGN float mtxPool[MTXPOOL_SIZE][16];
+extern int mtxPoolCount;
+extern CACHE_ALIGN float g_guProjSnapshot[16];
+// Per-frame projection matrix pool (GU HW transform). Same dedup scheme as mtxPool:
+// SetVertex interns the active projection and stamps each POLY with its projId, so
+// the renderer uploads the correct projection per group (fixes SM64's per-frame flash
+// caused by a single last-wins projection).
+extern CACHE_ALIGN float projPool[MTXPOOL_SIZE][16];
+extern int projPoolCount;
+
+// DS texture matrix snapshot (tex-coord transform mode 1, GU-offloaded).
+extern CACHE_ALIGN float texMtxCurrent[16];
+extern bool texMtxValid;
 
 extern CACHE_ALIGN u32 color_15bit_to_24bit[32768];
 extern CACHE_ALIGN u32 color_15bit_to_24bit_reverse[32768];

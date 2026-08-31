@@ -33,7 +33,7 @@
 #include "NDSSystem.h"
 
 
-#include "PSP/pspvfpu.h"
+
 
 using std::min;
 using std::max;
@@ -73,8 +73,13 @@ public:
 		for(int i=0;i<numItems;i++)
 		{
 			Item &item = items[i];
+
+			if (!item.ptr) 
+				continue;
+
 			int todo = min((int)item.len,size);
 			size -= todo;
+			
 			int temp = ::memcmp(item.ptr,((u8*)buf2)+item.ofs,todo);
 			if(temp) return temp;
 			if(size == 0) break;
@@ -95,10 +100,14 @@ public:
 		for(int i=0;i<numItems;i++)
 		{
 			Item item = items[i];
+
+			if (!item.ptr) 
+				continue;
+
 			int todo = min((int)item.len,size);
 			size -= todo;
 			done += todo;
-			fast_memcpy(bufptr,item.ptr,todo);
+			memcpy(bufptr,item.ptr,todo);
 			bufptr += todo;
 			if(size==0) return done;
 		}
@@ -222,7 +231,7 @@ public:
 	
 
 	//static const u32 kMaxCacheSize = 6*512*1024; //2MB
-	static const u32 kMaxCacheSize = 4*1024*1024; 
+	static const u32 kMaxCacheSize = 8*1024*1024; 
 	 // static const u32 kMaxCacheSize = 16*1024*1024; 
 	
 
@@ -400,7 +409,7 @@ public:
 		//dump palette data for cache keying
 		if(palSize)
 		{
-			fast_memcpy(newitem->dump.palette, pal, palSize*2);
+			memcpy(newitem->dump.palette, pal, palSize*2);
 		}
 
 		//dump texture and 4x4 index data for cache keying
@@ -686,6 +695,73 @@ public:
 			}
 		} //switch(texture format)
 
+		//============================================================================
+		// PSP palettized side-output (GU_PSM_T8 / T4)
+		//============================================================================
+		// For plain indexed formats (I8/I4) also produce a raw index buffer + a CLUT
+		// so the PSP renderer can upload a hardware-palettized texture (4-8x less
+		// bandwidth than the expanded 32bpp `decoded`). Only TexFormat_32bpp (used by
+		// the PSP GU renderer) needs this; colors must match the 32bpp decode, so the
+		// CLUT is built with RGB15TO32 and the same palette-0-transparent rule.
+		if (TEXFORMAT == TexFormat_32bpp &&
+		    (newitem->mode == TEXMODE_I8 || newitem->mode == TEXMODE_I4 || newitem->mode == TEXMODE_I2))
+		{
+			// Real palette entries used by this format, but the CLUT is allocated/
+			// loaded at the GU's block granularity: T8 loads 256, T4 loads 16. I2/I4
+			// both go to T4, so allocate 16 and zero-pad unused entries (prevents the
+			// renderer's 16-entry sceGuClutLoad from over-reading the CLUT buffer).
+			const int realentries = (newitem->mode == TEXMODE_I8) ? 256 :
+			                        (newitem->mode == TEXMODE_I4) ? 16 : 4;
+			const int clutalloc   = (newitem->mode == TEXMODE_I8) ? 256 : 16;
+			newitem->pal_count = realentries;
+			newitem->pal_clut  = (u32*)memalign(16, clutalloc * sizeof(u32));
+			for (int e = 0; e < clutalloc; e++) {
+				if (e < realentries) {
+					const u8 a = (e == 0) ? palZeroTransparent : opaqueColor;
+					newitem->pal_clut[e] = RGB15TO32(pal[e], a);
+				} else {
+					newitem->pal_clut[e] = 0;   // pad
+				}
+			}
+
+			const u32 npix = sizeX * sizeY;
+			if (newitem->mode == TEXMODE_I8) {
+				// T8: one index byte per texel, straight copy of the source indices.
+				newitem->pal_bpp = 8;
+				newitem->pal_indices = (u8*)memalign(16, npix);
+				u8* dst = newitem->pal_indices;
+				for (int j = 0; j < ms.numItems; j++)
+					memcpy(dst + ms.items[j].ofs, ms.items[j].ptr, ms.items[j].len);
+			} else if (newitem->mode == TEXMODE_I4) {
+				// T4: two 4-bit indices per byte; NDS packs low nibble = first texel,
+				// which is exactly the GU T4 nibble order, so a straight copy works.
+				newitem->pal_bpp = 4;
+				newitem->pal_indices = (u8*)memalign(16, npix / 2);
+				u8* dst = newitem->pal_indices;
+				for (int j = 0; j < ms.numItems; j++)
+					memcpy(dst + ms.items[j].ofs, ms.items[j].ptr, ms.items[j].len);
+			} else {
+				// I2: 4 indices per byte. PSP has no T2, so expand to T4 (one nibble
+				// per texel) to still benefit from a hardware palette.
+				newitem->pal_bpp = 4;
+				newitem->pal_indices = (u8*)memalign(16, npix / 2);
+				u8* dst = newitem->pal_indices;
+				u32 outpix = 0;
+				for (int j = 0; j < ms.numItems; j++) {
+					const u8* src = ms.items[j].ptr;
+					for (u32 x = 0; x < ms.items[j].len; x++) {
+						u8 b = src[x];
+						for (int k = 0; k < 4; k++) {
+							u8 idx = (b >> (k * 2)) & 0x3;
+							if (outpix & 1) dst[outpix >> 1] |= idx << 4;
+							else            dst[outpix >> 1] = idx;
+							outpix++;
+						}
+					}
+				}
+			}
+		}
+
 #ifdef DO_DEBUG_DUMP_TEXTURE
 	DebugDumpTexture(newitem);
 #endif
@@ -693,7 +769,7 @@ public:
 		return newitem;
 	} //scan()
 
-	static const int PALETTE_DUMP_SIZE = 96*1024;//64 + 32
+	static const int PALETTE_DUMP_SIZE = (64+16+16)*1024;
 	u8 paletteDump[PALETTE_DUMP_SIZE];
 
 	void invalidate()

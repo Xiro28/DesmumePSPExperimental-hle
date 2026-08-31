@@ -20,7 +20,7 @@
 //This handles almost all of the work of 3d rendering, leaving the renderer
 //plugin responsible only for drawing primitives.
 
-#define FLUSHMODE_HACK
+//#define FLUSHMODE_HACK
 
 //---------------
 //TODO TODO TODO TODO
@@ -53,7 +53,6 @@
 
 #include <map>
 
-#include "PSP/pspvfpu.h"
 //#include "movie.h" //only for currframecounter which really ought to be moved into the core emu....
 
 //#define _SHOW_VTX_COUNTERS	// show polygon/vertex counters on screen
@@ -61,6 +60,8 @@
 u32 max_polys, max_verts;
 #include "GPU_OSD.h"
 #endif
+
+//u8 gfx3d_commandBuffer[HACK_FIFO_BATCH_SIZE*4];
 
 
 /*
@@ -246,9 +247,20 @@ public:
 //while the fifo was full, apparently expecting the fifo not to be full by that time.
 //in general we are finding that 3d takes less time than we think....
 //although maybe the true culprit was charging the cpu less time for the dma.
-#define GFX_DELAY(x) NDS_RescheduleGXFIFO(1);
-#define GFX_DELAY_M2(x) NDS_RescheduleGXFIFO(1); 
+//#define GFX_DELAY(x) NDS_RescheduleGXFIFO(1, false);
+//#define GFX_DELAY_M2(x) NDS_RescheduleGXFIFO(1, false); 
 
+//XIRO - I think it's useless to infer multiple times this function since it induces an increduible overhead
+// Calling just once is more then enough to update the state of the emulator
+// The thing is that it might be some cycles off compared to the real implementation since some functions issues the reschedule 4 times while others just 1
+// A partial good solution is to update the cycles by 2, which I find to be a good compromise
+
+// Disable those
+#define GFX_DELAY(x) {}
+#define GFX_DELAY_M2(x) {}
+
+// baseline signature is NDS_RescheduleGXFIFO(u32 cost) -- the fork's second
+// 'update' argument came with its new sequencer, which is not ported yet.
 #define V_GFX_DELAY(x) NDS_RescheduleGXFIFO(x);
 
 using std::max;
@@ -428,6 +440,52 @@ VERTLIST* vertlists = NULL;
 VERTLIST* vertlist = NULL;
 int			polygonListCompleted = 0;
 
+// ---- Per-frame modelview matrix pool (for PSP GU hardware transform) ----
+// SetVertex() snapshots the active modelview (mtxCurrent[0]) into this pool,
+// deduping consecutive identical matrices, and stamps each completed POLY with
+// its mtxId. The PSP renderer groups draws by mtxId and uploads each matrix to
+// the GU once (sceGuSetMatrix(GU_MODEL)), so the GU does the modelview*proj
+// transform in hardware. This is the "context store / recycle" path.
+CACHE_ALIGN float mtxPool[MTXPOOL_SIZE][16];
+int               mtxPoolCount = 0;
+static u16        currentMtxId = 0;
+
+// Snapshot of the projection matrix (mtxCurrent[0]) for the PSP GU hardware-transform
+// path. Assumed roughly constant within a frame; SetVertex refreshes it, the renderer
+// uploads it once via sceGuSetMatrix(GU_PROJECTION). See rasterize.cpp GU_HW_TRANSFORM.
+CACHE_ALIGN float g_guProjSnapshot[16] = {0};
+CACHE_ALIGN float projPool[MTXPOOL_SIZE][16];
+int               projPoolCount = 0;
+static u16        currentProjId = 0;
+
+// Snapshot of the active DS texture matrix (mtxCurrent[3]) for tex-coord
+// transform mode 1, offloaded to the PSP GU texture matrix. One per frame is
+// the common case; texMtxValid says whether mode-1 UVs were seen this frame.
+CACHE_ALIGN float texMtxCurrent[16];
+bool              texMtxValid = false;
+
+static u16 mtxPool_intern(const float* m)
+{
+	// Fast path: same as the last interned matrix (the common case — modelview
+	// changes far less often than per-vertex).
+	if (mtxPoolCount > 0 && memcmp(mtxPool[mtxPoolCount - 1], m, 16 * sizeof(float)) == 0)
+		return (u16)(mtxPoolCount - 1);
+	if (mtxPoolCount >= MTXPOOL_SIZE)
+		return (u16)(mtxPoolCount - 1); // pool full: reuse last, avoid overflow
+	memcpy(mtxPool[mtxPoolCount], m, 16 * sizeof(float));
+	return (u16)(mtxPoolCount++);
+}
+
+static u16 projPool_intern(const float* m)
+{
+	if (projPoolCount > 0 && memcmp(projPool[projPoolCount - 1], m, 16 * sizeof(float)) == 0)
+		return (u16)(projPoolCount - 1);
+	if (projPoolCount >= MTXPOOL_SIZE)
+		return (u16)(projPoolCount - 1);
+	memcpy(projPool[projPoolCount], m, 16 * sizeof(float));
+	return (u16)(projPoolCount++);
+}
+
 int listTwiddle = 1;
 int triStripToggle;
 
@@ -449,6 +507,11 @@ static void twiddleLists() {
 	vertlist = &vertlists[listTwiddle];
 	polylist->count = 0;
 	vertlist->count = 0;
+	mtxPoolCount = 0;
+	currentMtxId = 0;
+	projPoolCount = 0;
+	currentProjId = 0;
+	texMtxValid = false;
 }
 
 static BOOL flushPending = FALSE;
@@ -687,11 +750,21 @@ float vec3dot(float* a, float* b) {
 	return result;	
 }
 
-#define SUBMITVERTEX(ii, nn) polylist->list[polylist->count].vertIndexes[ii] = tempVertInfo.map[nn];
+#define SUBMITVERTEX(ii, nn) poly.vertIndexes[ii] = tempVertInfo.map[nn];
 
 //Submit a vertex to the GE
 static void SetVertex()
 {
+
+	//refuse to do anything if we have too many verts or polys
+	polygonListCompleted = 0;
+
+	if(vertlist->count >= VERTLIST_SIZE) 
+			return;
+	if(polylist->count >= POLYLIST_SIZE) 
+			return;
+
+
 	float coord[3] = {
 			float16table[u16coord[0]],
 			float16table[u16coord[1]],
@@ -700,10 +773,9 @@ static void SetVertex()
 
 	ALIGN(16) float coordTransformed[4] = { coord[0], coord[1], coord[2], 1.f };
 
-
 	if (texCoordinateTransform == 3)
 	{
-		__asm__ volatile (
+		/*__asm__ volatile (
 
 			"lv.s S000,  0 + %2\n"
 			"lv.s S001, 16 + %2\n"
@@ -743,23 +815,16 @@ static void SetVertex()
 			
 			"sv.s S000, %0\n"
 			: "=m"(last_t) : "m"(coord[0]), "m"(mtxCurrent[3][1]), "m"(_t)
-		);
+		);*/
 
-		/*last_s = ((coord[0] * mtxCurrent[3][0] +
+		last_s = ((coord[0] * mtxCurrent[3][0] +
 			coord[1] * mtxCurrent[3][4] +
-			coord[2] * mtxCurrent[3][8]) + _s * 16.0f) / 16.0f;*/
+			coord[2] * mtxCurrent[3][8]) + _s * 16.0f) / 16.0f;
 
-		/*last_t = ((coord[0] * mtxCurrent[3][1] +
+		last_t = ((coord[0] * mtxCurrent[3][1] +
 			coord[1] * mtxCurrent[3][5] +
-			coord[2] * mtxCurrent[3][9]) + _t * 16.0f) / 16.0f;*/
+			coord[2] * mtxCurrent[3][9]) + _t * 16.0f) / 16.0f;
 	}
-
-	//refuse to do anything if we have too many verts or polys
-	polygonListCompleted = 0;
-	if(vertlist->count >= VERTLIST_SIZE) 
-			return;
-	if(polylist->count >= POLYLIST_SIZE) 
-			return;
 	
 	//printf("%f\n", mtxCurrent[3][0]);
 
@@ -767,6 +832,14 @@ static void SetVertex()
 	//so that we only have to multiply one matrix here
 	//(we could lazy cache the concatenated clip matrix and only generate it
 	//when we need to)
+	// Snapshot the active modelview into the pool BEFORE transforming, so the GU
+	// can re-apply it in hardware. mtxCurrent[0]=projection, [1]=modelview in
+	// DeSmuME's matrix-mode numbering. currentMtxId is stamped onto the poly below.
+	currentMtxId = mtxPool_intern(mtxCurrent[1]);
+	// Intern the active projection per-poly (not last-wins): SM64 uses several
+	// projections per frame, so one global projection made polys flash.
+	currentProjId = projPool_intern(mtxCurrent[0]);
+
 	MatrixMultVec4x4_M2(mtxCurrent[0], coordTransformed);
 
 	//TODO - culling should be done here.
@@ -789,6 +862,12 @@ static void SetVertex()
 	vert.coord[1] = coordTransformed[1];
 	vert.coord[2] = coordTransformed[2];
 	vert.coord[3] = coordTransformed[3];
+
+	// Object-space coords for the GU hardware transform path.
+	vert.rawcoord[0] = coord[0];
+	vert.rawcoord[1] = coord[1];
+	vert.rawcoord[2] = coord[2];
+	vert.rawcoord[3] = 1.0f;
 	
 	vert.color[0] = (colorRGB[0]);
 	vert.color[1] = (colorRGB[1]);
@@ -797,44 +876,49 @@ static void SetVertex()
 	tempVertInfo.count++;
 
 	//possibly complete a polygon
+	POLY &poly = polylist->list[polylist->count];
+	bool isCompletedPoly = false;
+
 	{
-		polygonListCompleted = 2;
+		//polygonListCompleted = 2;
 		switch(vtxFormat) {
 			case GFX3D_TRIANGLES:
 				if(tempVertInfo.count!=3)
 					break;
-				polygonListCompleted = 1;
-				//vertlist->list[polylist->list[polylist->count].vertIndexes[i] = vertlist->count++] = tempVertList.list[n];
+				
+				isCompletedPoly = true;
+				poly.type = POLYGON_TYPE_TRIANGLE;
+				
 				SUBMITVERTEX(0,0);
 				SUBMITVERTEX(1,1);
 				SUBMITVERTEX(2,2);
+
 				vertlist->count+=3;
-				polylist->list[polylist->count].type = 3;
-				//polylist->list[polylist->count].typeGU = 0;
 				tempVertInfo.count = 0;
 				break;
 			case GFX3D_QUADS:
 				if(tempVertInfo.count!=4)
 					break;
-				polygonListCompleted = 1;
+
+				isCompletedPoly = true;
+				poly.type = POLYGON_TYPE_QUAD;
 				SUBMITVERTEX(0,0);
 				SUBMITVERTEX(1,1);
 				SUBMITVERTEX(2,2);
 				SUBMITVERTEX(3,3);
+
 				vertlist->count+=4;
-				polylist->list[polylist->count].type = 4;
-				//polylist->list[polylist->count].typeGU = 1;
 				tempVertInfo.count = 0;
 				break;
 			case GFX3D_TRIANGLE_STRIP:
 				if(tempVertInfo.count!=3)
 					break;
-				polygonListCompleted = 1;
+				isCompletedPoly = true;
+				poly.type = POLYGON_TYPE_TRIANGLE;
+
 				SUBMITVERTEX(0,0);
 				SUBMITVERTEX(1,1);
 				SUBMITVERTEX(2,2);
-				polylist->list[polylist->count].type = 3;
-				//polylist->list[polylist->count].typeGU = 2;
 
 				if(triStripToggle)
 					tempVertInfo.map[1] = vertlist->count+2-continuation;
@@ -853,18 +937,24 @@ static void SetVertex()
 			case GFX3D_QUAD_STRIP:
 				if(tempVertInfo.count!=4)
 					break;
-				polygonListCompleted = 1;
+				
+				isCompletedPoly = true;
+				poly.type = POLYGON_TYPE_QUAD;
+				
 				SUBMITVERTEX(0,0);
 				SUBMITVERTEX(1,1);
 				SUBMITVERTEX(2,3);
 				SUBMITVERTEX(3,2);
-				polylist->list[polylist->count].type = 4;
+
 				//polylist->list[polylist->count].typeGU = 3;
 				tempVertInfo.map[0] = vertlist->count+2-continuation;
 				tempVertInfo.map[1] = vertlist->count+3-continuation;
+
 				if(tempVertInfo.first)
 					vertlist->count+=4;
-				else vertlist->count+=2;
+				else 
+					vertlist->count+=2;
+				
 				tempVertInfo.first = false;
 				tempVertInfo.count = 2;
 				break;
@@ -872,28 +962,21 @@ static void SetVertex()
 				return;
 		}
 
-		if(polygonListCompleted == 1)
+		if(isCompletedPoly)
 		{
-			POLY &poly = polylist->list[polylist->count];
-			
 			poly.vtxFormat = vtxFormat;
 
 			// Line segment detect
 			// Tested" Castlevania POR - warp stone, trajectory of ricochet, "Eye of Decay"
 			if (!(textureFormat & NOTEXTURE_FLAG))	// no texture
 			{
-				bool duplicated = false;
-				VERT &vert0 = vertlist->list[poly.vertIndexes[0]];
-				VERT &vert1 = vertlist->list[poly.vertIndexes[1]];
-				VERT &vert2 = vertlist->list[poly.vertIndexes[2]];
-				if ( (vert0.x == vert1.x) && (vert0.y == vert1.y) ) duplicated = true;
-				else
-					if ( (vert1.x == vert2.x) && (vert1.y == vert2.y) ) duplicated = true;
-					else
-						if ( (vert0.y == vert1.y) && (vert1.y == vert2.y) ) duplicated = true;
-						else
-							if ( (vert0.x == vert1.x) && (vert1.x == vert2.x) ) duplicated = true;
-				if (duplicated)
+				const VERT &vtx0 = vertlist->list[poly.vertIndexes[0]];
+				const VERT &vtx1 = vertlist->list[poly.vertIndexes[1]];
+				const VERT &vtx2 = vertlist->list[poly.vertIndexes[2]];
+				if (((vtx0.x == vtx1.x) && (vtx0.y == vtx1.y)) ||
+					((vtx1.x == vtx2.x) && (vtx1.y == vtx2.y)) ||
+					((vtx0.y == vtx1.y) && (vtx1.y == vtx2.y)) ||
+					((vtx0.x == vtx1.x) && (vtx1.x == vtx2.x)) )
 				{
 					//printf("Line Segmet detected (poly type %i, mode %i, texparam %08X)\n", poly.type, poly.vtxFormat, textureFormat);
 					poly.vtxFormat = vtxFormat + 4;
@@ -904,6 +987,8 @@ static void SetVertex()
 			poly.texParam = textureFormat;
 			poly.texPalette = texturePalette;
 			poly.viewport = viewport;
+			poly.mtxId = currentMtxId;
+			poly.projId = currentProjId;
 			polylist->count++;
 		}
 	}
@@ -1044,10 +1129,10 @@ static void gfx3d_glRestoreMatrix(u32 v)
 
 	MatrixCopy (mtxCurrent[mymode], MatrixStackGetPos(&mtxStack[mymode], v));
 
-	GFX_DELAY(36);
-
 	if (mymode == 2)
 		MatrixCopy (mtxCurrent[1], MatrixStackGetPos(&mtxStack[1], v));
+	
+	GFX_DELAY(36);
 }
 
 static void gfx3d_glLoadIdentity()
@@ -1384,11 +1469,12 @@ static void gfx3d_glNormal(u32 v)
 		colorRGB[c] = std::min(31,vertexColor[c]);
 	}
 
-	GFX_DELAY(9);
-	GFX_DELAY_M2(/*(lightMask) & 0x01*/);
-	GFX_DELAY_M2(/*(lightMask>>1) & 0x01*/);
-	GFX_DELAY_M2(/*(lightMask>>2) & 0x01*/);
-	GFX_DELAY_M2(/*(lightMask>>3) & 0x01*/);
+	V_GFX_DELAY(4);
+	/*GFX_DELAY(9);
+	GFX_DELAY_M2();
+	GFX_DELAY_M2();
+	GFX_DELAY_M2();
+	GFX_DELAY_M2();*/
 }
 
 
@@ -1404,37 +1490,21 @@ static void gfx3d_glTexCoord(u32 val)
 
 	if (texCoordinateTransform == 1)
 	{
-		//printf("glTextcord\n");
-		__asm__ volatile (
-
-			"lv.s S000,  %1\n"
-			"lv.s S001,  %2\n"
-			"vfim.s S002, 0.0625\n"
-			"vfim.s S003, 0.0625\n"
-
-			"vscl.p C000, C000, S002\n"
-
-			"sv.s S000, %1\n"
-			"sv.s S001, %2\n"
-
-			"lv.q C100,  0 + %3\n"
-
-			"vmul.q C100, C000, C100\n"
-			"vfad.q S100, C100\n"
-			"sv.s S100, %0\n"
-
-			: "=m"(last_s), "+m"(_s), "+m"(_t): "m"(mtxCurrent[3][0])
-		);
-
-			/*last_s = _s * mtxCurrent[3][0] + _t * mtxCurrent[3][4] +
-				0.0625f * mtxCurrent[3][8] + 0.0625f * mtxCurrent[3][12];*/
-			last_t = _s * mtxCurrent[3][1] + _t * mtxCurrent[3][5] +
-				0.0625f * mtxCurrent[3][9] + 0.0625f * mtxCurrent[3][13];
+		// CPU tex-coord transform (mode 1): last_s/t = (s,t)/16 * mtxCurrent[3].
+		const float s = _s * 0.0625f;
+		const float t = _t * 0.0625f;
+		last_s = s * mtxCurrent[3][0] + t * mtxCurrent[3][4] +
+		         0.0625f * mtxCurrent[3][8] + 0.0625f * mtxCurrent[3][12];
+		last_t = s * mtxCurrent[3][1] + t * mtxCurrent[3][5] +
+		         0.0625f * mtxCurrent[3][9] + 0.0625f * mtxCurrent[3][13];
 	}
 	else
 	{
-		_s /= 16.0f;
-		_t /= 16.0f;
+		/*_s /= 16.0f;
+		_t /= 16.0f;*/
+
+		_s = (int)(_s) >> 4;
+		_t = (int)(_t) >> 4;
 
 		last_s = _s;
 		last_t = _t;
@@ -1575,8 +1645,7 @@ static void gfx3d_glLightDirection (u32 v)
 {
 	int index = v>>30;
 
-	//lightDirection[index] = (s32)(v&0x3FFFFFFF);
-	lightDirection[index] = v;
+	lightDirection[index] = (s32)(v&0x3FFFFFFF);
 	gfx3d_glLightDirection_cache(index);
 	GFX_DELAY(6);
 }
@@ -1639,10 +1708,10 @@ static BOOL gfx3d_glBoxTest(u32 v)
 	MMU_new.gxstat.tr = 0;		// clear boxtest bit
 	MMU_new.gxstat.tb = 1;		// busy
 
-	/*BTcoords[BTind++] = v & 0xFFFF;
-	BTcoords[BTind++] = v >> 16;*/
+	BTcoords[BTind++] = v & 0xFFFF;
+	BTcoords[BTind++] = v >> 16;
 
-	BTind++;BTind++;
+	//BTind++;BTind++;
 
 	if (BTind < 5) return FALSE;
 	BTind = 0;
@@ -1650,23 +1719,13 @@ static BOOL gfx3d_glBoxTest(u32 v)
 	MMU_new.gxstat.tb = 0;		// clear busy
 	GFX_DELAY(103);
 
-#if 0
-	INFO("BoxTEST: x %f y %f width %f height %f depth %f\n", 
-				BTcoords[0], BTcoords[1], BTcoords[2], BTcoords[3], BTcoords[4], BTcoords[5]);
-	/*for (int i = 0; i < 16; i++)
-	{
-		INFO("mtx1[%i] = %f ", i, mtxCurrent[1][i]);
-		if ((i+1) % 4 == 0) INFO("\n");
-	}
-	INFO("\n");*/
-#endif
-
+/*
 	//(crafted to be clear, not fast.)
 
 	//nanostray title, ff4, ice age 3 depend on this and work
 	//garfields nightmare and strawberry shortcake DO DEPEND on the overflow behavior.
 
-	/*u16 ux = BTcoords[0];
+	u16 ux = BTcoords[0];
 	u16 uy = BTcoords[1];
 	u16 uz = BTcoords[2];
 	u16 uw = BTcoords[3];
@@ -2312,6 +2371,18 @@ void gfx3d_execute3D()
 
 	//if(!my_config.Render3D) return;
 
+	/*
+		New idea of implementing this function using psp hardware:
+		instead of realying of external values that later are going to be reimplemented inside
+		the psp gu, we can just use the psp gu to execute the commands.
+
+		So we start by doind gu_start() before the loop and gu_end() after the loop.
+		The list is configured to be called later, maybe at the start of the next 3D frame drawn.
+
+		For now this can be an optimal implementation, but later we can execute directly the commands as 
+		soon as we receive them, so we can avoid the overhead generated by executing all those functions.
+	*/
+
 	const u8 HACK_FIFO_BATCH_SIZE = 64;
 
 	//this is a SPEED HACK
@@ -2319,11 +2390,15 @@ void gfx3d_execute3D()
 	//without this batch size the emuloop will escape way too often to run fast.
 	u8 cost = 0;
 
+	//sceGuStart(GU_DIRECT, &gfx3d_commandBuffer[0]);
+
 	for(u8 i=HACK_FIFO_BATCH_SIZE;--i;) 
 	{
 		if(likely(GFX_PIPErecv(&cmd, &param)))
 		{
 			//if (isSwapBuffers) printf("Executing while swapbuffers is pending: %d:%08X\n",cmd,param);
+
+			//GFX_DELAY(1);
 
 			//since we did anything at all, incur a pipeline motion cost.
 			//also, we can't let gxfifo sequencer stall until the fifo is empty.
@@ -2332,7 +2407,7 @@ void gfx3d_execute3D()
 			//..these guys will ordinarily set a delay, but multi-param operations won't
 			//for the earlier params.
 			//printf("%05d:%03d:%12lld: executed 3d: %02X %08X\n",currFrameCounter, nds.VCount, nds_timer , cmd, param);
-		//	if(HasTo_ogfx3d_execute(cmd,param))
+			//if(HasTo_ogfx3d_execute(cmd,param))
 			gfx3d_execute(cmd, param);
 
 			cost++;
@@ -2343,11 +2418,13 @@ void gfx3d_execute3D()
 			//the true answer is probably dma bus blocking.. but lets go ahead and try this and
 			//check the compatibility, at the very least it will be nice to know if any games suffer from
 			//3d running too fast
-			MMU.gfx3dCycles = nds_timer + 2;
+			//MMU.gfx3dCycles = nds_timer + 1;
 		} else break;
 	}
+
+	//sceGuFinish();
 	
-	if (cost) V_GFX_DELAY(cost); 
+	if (cost) V_GFX_DELAY(cost * 4); // Hack to not call the reschedule function too often 
 }
 
 void gfx3d_glFlush(u32 v)
@@ -2368,17 +2445,20 @@ void gfx3d_glFlush(u32 v)
 
 static inline bool gfx3d_ysort_compare_orig(int num1, int num2)
 {
-	const POLY &poly1 = polylist->list[num1];
-	const POLY &poly2 = polylist->list[num2];
+    const POLY &poly1 = polylist->list[num1];
+    const POLY &poly2 = polylist->list[num2];
 
-	if(poly1.maxy != poly2.maxy) 
-		return poly1.maxy < poly2.maxy; 
-	if(poly1.miny != poly2.miny) 
-		return poly1.miny < poly2.miny; 
+    if(poly1.maxy != poly2.maxy) 
+        return poly1.maxy < poly2.maxy;
+    if(poly1.miny != poly2.miny) 
+        return poly1.miny < poly2.miny;
 
-	return num1 < num2;
+    // CAMBIA: usa maxz come tiebreak finale
+    if(poly1.maxz != poly2.maxz)
+        return poly1.maxz > poly2.maxz;  // Z più grande = più lontano = disegna prima
+
+    return num1 < num2;
 }
-
 static inline bool gfx3d_ysort_compare_kalven(int num1, int num2)
 {
 	const POLY &poly1 = polylist->list[num1];
@@ -2405,13 +2485,9 @@ static inline bool gfx3d_zsort_compare(int num1, int num2)
 {
 	const POLY& poly1 = polylist->list[num1];
 	const POLY& poly2 = polylist->list[num2];
-
-	/*if (poly1.maxz != poly2.maxz)
-		return poly1.maxz < poly2.maxz;
-	if (poly1.minz != poly2.minz)
-	*/	
-	return poly1.minz <= poly2.minz;
-	//return num1 < num2;
+	
+	// Disegna PRIMA i poligoni più lontani (Back-to-Front)
+	return std::abs(poly1.maxz) > std::abs(poly2.maxz);
 }
 
 static bool gfx3d_ysort_compare(int num1, int num2)
@@ -2432,8 +2508,6 @@ static void gfx3d_doFlush()
 	//the renderer will get the lists we just built
 	gfx3d.polylist = polylist;
 	gfx3d.vertlist = vertlist;
-
-	int polycount = polylist->count;
 
 	//and also our current render state
 	if(BIT1(control)) gfx3d.state.shading = GFX3D_State::HIGHLIGHT;
@@ -2468,74 +2542,70 @@ static void gfx3d_doFlush()
 		gfx3d.renderState.enableFog = false;
 	
 	gfx3d.state.activeFlushCommand = gfx3d.state.pendingFlushCommand;
-	
-	//printf("%d\n",polycount);
-#ifdef _SHOW_VTX_COUNTERS
-	max_polys = max((u32)polycount, max_polys);
-	max_verts = max((u32)vertlist->count, max_verts);
-	osd->addFixed(180, 20, "%i/%i", polycount, vertlist->count);		// current
-	osd->addFixed(180, 35, "%i/%i", max_polys, max_verts);		// max
-#endif
+
+	const int polycount = polylist->count;
 
 
-//find the min and max y values for each poly.
-	//TODO - this could be a small waste of time if we are manual sorting the translucent polys
-	//TODO - this _MUST_ be moved later in the pipeline, after clipping.
-	//the w-division here is just an approximation to fix the shop in harvest moon island of happiness
-	//also the buttons in the knights in the nightmare frontend depend on this
-	/*for(int i=0; i<polycount; i++)
+	// frameAllOrtho: all vertices w==1 (pure 2D-ortho UI frame). Used only by the
+	// opt-in "sort_3d" path for the |z| heuristic.
+	bool frameAllOrtho = true;
+
+	for (size_t i = 0; i < polycount; i++)
 	{
-		// TODO: Possible divide by zero with the w-coordinate.
-		// Is the vertex being read correctly? Is 0 a valid value for w?
-		// If both of these questions answer to yes, then how does the NDS handle a NaN?
-		// For now, simply prevent w from being zero.
 		POLY &poly = polylist->list[i];
-		float verty = vertlist->list[poly.vertIndexes[0]].y;
-		float vertw = (vertlist->list[poly.vertIndexes[0]].w != 0.0f) ? vertlist->list[poly.vertIndexes[0]].w : 0.00000001f;
-		verty = 1.0f-(verty+vertw)/(2*vertw);
-		poly.miny = poly.maxy = verty;
+		float furthest_z = -1e28f;  // signed max z/w (back-to-front key)
+		float maxAbsZ    = 0.0f;    // max |z/w| (foreground-distance key for ortho UI)
 
-		for(int j=1; j<poly.type; j++)
-		{
-			verty = vertlist->list[poly.vertIndexes[j]].y;
-			vertw = (vertlist->list[poly.vertIndexes[j]].w != 0.0f) ? vertlist->list[poly.vertIndexes[j]].w : 0.00000001f;
-			verty = 1.0f-(verty+vertw)/(2*vertw);
-			poly.miny = min(poly.miny, verty);
-			poly.maxy = max(poly.maxy, verty);
+		for (size_t j = 0; j < poly.type; j++) {
+			float vw = vertlist->list[poly.vertIndexes[j]].w;
+			float vz = vertlist->list[poly.vertIndexes[j]].z;
+
+			if (fabsf(vw - 1.0f) > 1e-3f) frameAllOrtho = false;
+
+			float current_z = 0.0f;
+			if (gfx3d.state.wbuffer) {
+				current_z = vw;
+			} else {
+				current_z = (vw != 0.0f) ? (vz / vw) : 0.0f;
+			}
+
+			if (current_z > furthest_z) furthest_z = current_z;
+			if (fabsf(current_z) > maxAbsZ) maxAbsZ = fabsf(current_z);
 		}
 
-	}*/
-
-
-	//we need to sort the poly list with alpha polys last
-	//first, look for opaque polys
-	int ctr = 0;
-	for (int i = 0;i < polycount;i++) {
-		POLY& poly = polylist->list[i];
-		if (!poly.isTranslucent())
-			gfx3d.indexlist.list[ctr++] = i;
-	}
-	int opaqueCount = ctr;
-	//then look for translucent polys
-	for (int i = 0;i < polycount;i++) {
-		POLY& poly = polylist->list[i];
-		if (poly.isTranslucent())
-			gfx3d.indexlist.list[ctr++] = i;
+		poly.maxz = furthest_z;
+		poly.minz = maxAbsZ;
 	}
 
-	//NOTE: the use of the stable_sort below must be here as a workaround for some compilers on osx and linux.
-	//we're hazy on the exact behaviour of the resulting bug, all thats known is the list gets mangled somehow.
-	//it should not in principle be relevant since the predicate results in no ties.
-	//perhaps the compiler is buggy. perhaps the predicate is wrong.
+	size_t ctr = 0;
+	for (size_t i = 0; i < polycount; i++)
+		gfx3d.indexlist.list[ctr++] = i;
 
-	//now we have to sort the opaque polys by y-value.
-	//(test case: harvest moon island of happiness character cretor UI)
-	//should this be done after clipping??
-    
-	//std::stable_sort(gfx3d.indexlist.list, gfx3d.indexlist.list + opaqueCount, gfx3d_ysort_compare);
-	//std::stable_sort(gfx3d.indexlist.list, gfx3d.indexlist.list + opaqueCount, gfx3d_zsort_compare);
-	
-
+	if (my_config.sort_3d) {
+		// Opt-in "3D UI depth fix": opaque first, then translucent; for pure 2D-ortho
+		// UI frames order by |z| ascending (background plane first) so coplanar menus
+		// (e.g. Tetris DS) layer correctly. Wrong for some games, hence opt-in.
+		const bool useOrthoZ = frameAllOrtho;
+		std::stable_sort(gfx3d.indexlist.list,
+						 gfx3d.indexlist.list + polycount,
+						 [useOrthoZ](int num1, int num2) {
+							u32 a1 = (polylist->list[num1].polyAttr >> 16) & 0x1F;
+							u32 a2 = (polylist->list[num2].polyAttr >> 16) & 0x1F;
+							bool t1 = (a1 < 31), t2 = (a2 < 31);
+							if (t1 != t2) return !t1;        // opaque before translucent
+							float z1 = useOrthoZ ? polylist->list[num1].minz : polylist->list[num1].maxz;
+							float z2 = useOrthoZ ? polylist->list[num2].minz : polylist->list[num2].maxz;
+							if (z1 != z2) return z1 < z2;    // background/far first
+							return false;                    // tie: submission order (stable)
+						 });
+	} else {
+		// Default painter's: back-to-front (largest maxz first). Pokemon-safe.
+		std::stable_sort(gfx3d.indexlist.list,
+						 gfx3d.indexlist.list + polycount,
+						 [](int num1, int num2) {
+							return polylist->list[num1].maxz > polylist->list[num2].maxz;
+						 });
+	}
 /*
 	if (!gfx3d.state.sortmode)
 	{
@@ -2546,7 +2616,14 @@ static void gfx3d_doFlush()
 
 	//switch to the new lists
 	twiddleLists();
-
+	
+	//printf("%d\n",polycount);
+#ifdef _SHOW_VTX_COUNTERS
+	max_polys = max((u32)polycount, max_polys);
+	max_verts = max((u32)vertlist->count, max_verts);
+	osd->addFixed(180, 20, "%i/%i", polycount, vertlist->count);		// current
+	osd->addFixed(180, 35, "%i/%i", max_polys, max_verts);		// max
+#endif
 	/*if(driver->view3d->IsRunning())
 	{
 //		viewer3d_state->frameNumber = currFrameCounter;
@@ -2560,11 +2637,24 @@ static void gfx3d_doFlush()
 	drawPending = TRUE;
 }
 
+#if PROFILER_ENABLED
+extern u32 g_prof_gfx3d_us;
+extern "C" unsigned int prof_us(void);
+#endif
+
 void gfx3d_VBlankSignal()
 {
 	if (isSwapBuffers)
 	{
-		gfx3d_doFlush();
+		#ifndef FLUSHMODE_HACK
+		#if PROFILER_ENABLED
+			const u32 _pf = prof_us();
+			gfx3d_doFlush();
+			g_prof_gfx3d_us += prof_us() - _pf;
+		#else
+			gfx3d_doFlush();
+		#endif
+		#endif
 
 		GFX_DELAY(392);
 		isSwapBuffers = FALSE;
@@ -2575,12 +2665,14 @@ void gfx3d_VBlankSignal()
 
 void gfx3d_VBlankEndSignal(bool skipFrame)
 {
-	if (!drawPending) return;
 	if(skipFrame) return;
+	if (!drawPending) return;
 
 	drawPending = FALSE;
+
 	
-	gpu3D->NDS_3D_Render();
+	
+ 	//gpu3D->NDS_3D_Render();
 }
 
 //#define _3D_LOG
@@ -2699,21 +2791,25 @@ void gfx3d_glGetLightColor(unsigned int index, unsigned int* dest)
 
 #include"rasterize.h"
 
+uint32_t line_32D[GFX3D_FRAMEBUFFER_WIDTH] {0x0};
 
 void gfx3d_GetLineData(int line, u8** dst)
 {
 	//gpu3D->NDS_3D_RenderFinish();
 
 	//comment this if using GU 3D
-	*dst = (u8*)(_screen + _3DLineAddr[line]);
+	*dst = (u8*)&line_32D[0];
 }
 
 void gfx3d_GetLineData15bpp(int line, u16** dst)
 {
+	*dst = (u16*)&line_32D[0];
+	
 	//TODO - this is not very thread safe!!!
 	/*static u16 buf[GFX3D_FRAMEBUFFER_WIDTH];
 	*dst = buf;
  
+	
 	u8* lineData;
 	gfx3d_GetLineData(line, &lineData);
 	for(int i=0; i<GFX3D_FRAMEBUFFER_WIDTH; i++)
@@ -2965,17 +3061,9 @@ static FORCEINLINE VERT clipPoint(VERT* inside, VERT* outside, int coord, int wh
 					"vscl.q			c010, c010, S000\n"  //t * (outside - inside)
 					"vadd.q			c010, c020, c010\n"  //ret + t * (outside - inside)
 
-					/*"vadd.s		    S010, S010, S013\n"
-					"vadd.s		    S011, S011, S013\n"
-					"vadd.s		    S012, S012, S013\n"
-
-					// 1/(w*2)
-					"vadd.s		    S003, S013, S013\n"
-					"vrcp.s		    S003, S003\n"
-
-					"vscl.t		    c010, c010, S003\n"*/
-
 					"sv.q			c010, 0 + %0\n"  //ret coord
+
+					/*#ifdef SoftRendering
 
 					// load tex coords
 					"lv.s			S020, 0 + %6\n"  //inside tex
@@ -2999,6 +3087,7 @@ static FORCEINLINE VERT clipPoint(VERT* inside, VERT* outside, int coord, int wh
 					"vadd.q			c010, c020, c010\n"  //ret + t * (outside - inside)
 
 					"sv.q			c010, 0 + %2\n"  //ret color
+					#endif*/
 
 					: "=m"(ret.coord[0]), "=m"(ret.texcoord[0]), "=m"(ret.color[0])
 					: "m"(t), "m"(inside->coord[0]), "m"(outside->coord[0]),
@@ -3182,41 +3271,7 @@ template<bool hirez> void GFX3D_Clipper::clipPoly(POLY* poly, VERT** verts)
 	}
 }
 
-int GFX3D_Clipper::clipPolyGU(POLY* poly, VERT** verts, Vertex* guVerts)
-{
-	//CLIPLOG("==Begin poly==\n");
-	return 0;
 
-	int type = poly->type;
-	numScratchClipVerts = 0;
-
-	clipper.init(clippedPolys[clippedPolyCounter].clipVerts);
-	for (int i = 0;i < type;i++) {
-		clipper.clipVert(verts[i]);
-	}
-	int outType = clipper.finish();
-
-	//assert((u32)outType < MAX_CLIPPED_VERTS);
-	if (outType < 3)
-	{
-		//a totally clipped poly. discard it.
-		//or, a degenerate poly. we're not handling these right now
-		return 0;
-	}
-	else
-	{
-		for (int i = 0; i < outType;++i)
-		{
-
-		}
-
-		clippedPolys[clippedPolyCounter].type = outType;
-		clippedPolys[clippedPolyCounter].poly = poly;
-		clippedPolyCounter++;
-	}
-
-	return outType;
-}
 //these templates needed to be instantiated manually
 template void GFX3D_Clipper::clipPoly<true>(POLY* poly, VERT** verts);
 template void GFX3D_Clipper::clipPoly<false>(POLY* poly, VERT** verts);
