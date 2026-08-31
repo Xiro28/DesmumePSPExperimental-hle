@@ -1572,8 +1572,6 @@ const u64 kWifiCycles = 67;//34*2;
 
 void Sequencer::init()
 {
-	NDS_RescheduleTimers();
-	NDS_RescheduleDMA();
 
 	NDS_ReschedulePtr = 0;
 	nds_timer = 0;
@@ -1602,6 +1600,14 @@ void Sequencer::init()
 	#else
 	wifi.enabled = false;
 	#endif
+
+	// Build the ordered event list, then seed it. Without this popNext() has
+	// nothing to return and the emulation never starts.
+	sequencer.reSchedule();
+	updateEvent<DISP_CNT, true>();
+
+	NDS_RescheduleTimers();
+	NDS_RescheduleDMA();
 }
 
 bool ARM7_SKIP_HACK = false;
