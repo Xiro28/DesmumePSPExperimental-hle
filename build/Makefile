@@ -99,7 +99,7 @@ CFLAGS = -O3 -DNOPRINTF -finline-functions -fno-rtti -ffast-math -fweb   -G0 -Wa
                   -fcall-saved-s0 -fcall-saved-s1 -fcall-saved-s2 -fcall-saved-s3 -fcall-saved-s4 
 
 
-CXXFLAGS = $(CFLAGS) -fexceptions -std=gnu++20
+CXXFLAGS = $(CFLAGS) -fexceptions -std=gnu++2b
 
 ASFLAGS = $(CFLAGS) 
 

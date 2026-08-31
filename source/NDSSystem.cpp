@@ -1261,8 +1261,8 @@ void Sequencer::init()
 }
 
 bool ARM7_SKIP_HACK = false;
-bool ARM9_SKIP_HACK = true;
-bool math_underclock = true;
+bool ARM9_SKIP_HACK = false;
+bool math_underclock = false;
 
 static void execHardware_hblank()
 {
@@ -1773,12 +1773,12 @@ void NDS_exec(s32 nb)
 
 		u32 arm9arm7 = armInnerLoop<true,true,true>(nds_timer_base,s32next,arm9,arm7);
 
-		ARM7_SKIP_HACK = nds.hw_status.VCount < 180 || (my_config.extrmarm7down && nds.hw_status.VCount > 230);
+		//ARM7_SKIP_HACK = nds.hw_status.VCount < 180 || (my_config.extrmarm7down && nds.hw_status.VCount > 230);
 		//ARM7_SKIP_HACK = (nds.hw_status.VCount > 230 && ipc_fifo[ARM7].size > 0) || nds.hw_status.VCount < 185;
 
-		ARM9_SKIP_HACK = nds.hw_status.VCount > 250;
+		//ARM9_SKIP_HACK = nds.hw_status.VCount > 250;
 
-		math_underclock = nds.hw_status.VCount > 250;
+		//math_underclock = nds.hw_status.VCount > 250;
 
 		arm9 = arm9arm7>>16;
 		arm7 = arm9arm7&0xFFFF;

@@ -281,8 +281,12 @@ void ResetRom() {
 	execute = true;
 }
 
-const int TARGET_FPS = 30;
-const int FRAME_TIME_MICROSEC = 1000000 / TARGET_FPS;
+// Frame-rate cap, selectable from the menu (my_config.fps_cap_num):
+//   0 = uncapped (frameskip only), then 60, 50, 40, 30, 25 fps.
+constexpr int max_framerate[] = {
+    1000000 / 1000, 1000000 / 60, 1000000 / 50,
+    1000000 / 40,   1000000 / 30, 1000000 / 25,
+};
 
 int main(int argc, char **argv) {
 
@@ -359,13 +363,24 @@ int main(int argc, char **argv) {
       last_fps_timing = curr_timing;
     }
 
-    if (my_config.fps_cap){
-        const auto elapsedFrameTime = (curr_timing - previous_time);
+    // Frame-rate limiting. Advancing previous_time by exactly one frame period
+    // (rather than snapping it to now) keeps the pacing steady and lets a late
+    // frame be made up for, instead of drifting.
+    if (my_config.fps_cap_num > 0)
+    {
+        // Clamp: a stale or hand-edited config must not index out of the table.
+        const int cap_idx = (my_config.fps_cap_num < (int)(sizeof(max_framerate) / sizeof(max_framerate[0])))
+                            ? my_config.fps_cap_num : 1;
+        const int FRAME_TIME_MICROSEC = max_framerate[cap_idx];
+        const u32 elapsedFrameTime = curr_timing - previous_time;
 
-        if (elapsedFrameTime <= FRAME_TIME_MICROSEC)
+        if (elapsedFrameTime < (u32)FRAME_TIME_MICROSEC)
+        {
           sceKernelDelayThread(FRAME_TIME_MICROSEC - elapsedFrameTime);
-
-        previous_time = curr_timing;
+          previous_time += FRAME_TIME_MICROSEC;
+        }
+        else
+          previous_time = curr_timing;   // running behind: resync
     }
   }
 
