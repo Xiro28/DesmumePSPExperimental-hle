@@ -1803,6 +1803,7 @@ void NDS_exec(s32 nb)
 	if (PSP_UC(RenderDone)){
 		PSP_UC(Do2dRender) = true;
 		EMU_SCREEN();
+		EMU_SCREEN_Finish();
 		return;
 	}
 
@@ -1810,6 +1811,10 @@ void NDS_exec(s32 nb)
 		renderScreenFull();
 		EMU_SCREEN();
 	}
+
+	// The ported PSPDisplay presents the frame here, not inside EMU_SCREEN:
+	// its double-buffer scheme moved sceGuSwapBuffers() into this call.
+	EMU_SCREEN_Finish();
 }
 
 template<int PROCNUM> static void execHardware_interrupts_core()

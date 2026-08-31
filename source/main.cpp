@@ -329,6 +329,7 @@ int main(int argc, char **argv) {
   #endif
 
   EMU_SCREEN();
+  EMU_SCREEN_Finish();   // present it: the swap lives in Finish now
 
   u8 _frameskip = my_config.frameskip;
 

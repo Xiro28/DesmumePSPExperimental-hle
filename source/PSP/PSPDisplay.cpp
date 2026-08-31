@@ -810,10 +810,12 @@ static void Draw2DTexture(volatile u8* texture_buffer, int screen_x, int screen_
     sceGuDrawArray(GU_SPRITES, TEXTURE_FLAGS, n_slices_right * 2, NULL, slices_right);
 }
 
-// No-argument form used by the baseline's NDS_exec()/main(): draw both screens.
+// No-argument form used by the baseline's NDS_exec()/main(). The two
+// parameters are skip2d/skip3d, so they must be false to draw anything:
+// EMU_SCREEN(true, true) returns immediately and nothing appears.
 void EMU_SCREEN()
 {
-	EMU_SCREEN(true, true);
+	EMU_SCREEN(false, false);
 }
 
 void EMU_SCREEN(bool skip2d, bool skip3d)
