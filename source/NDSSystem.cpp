@@ -610,6 +610,11 @@ void GameInfo::closeROM()
 
 #include <unordered_map>
 
+extern u32 g_dbg_hw, g_dbg_cpu, g_dbg_irq, g_dbg_a9, g_dbg_a7, g_dbg_draw, g_dbg_vbl;
+extern u32 g_dbg_hw_disp, g_dbg_hw_none;
+extern u64 g_dbg_ts; extern u32 g_dbg_en;
+void loop_dbg_report(void);
+
 std::unordered_map<u32, u32> cached_rom;
 
 u32 GameInfo::readROM(u32 pos)
@@ -1296,12 +1301,20 @@ struct Sequencer
 	template <EventID id>
 	s32 computeNext()
 	{
-		return handlers[id].computeNext(handlers[id].instance) - nds_timer;
+		// Both sides are u64: for an event already due this subtraction wraps to a
+		// huge value, which then truncates to a bogus s32 and poisons the list.
+		// Compare first, and clamp a due event to 0.
+		const u64 when = handlers[id].computeNext(handlers[id].instance);
+		return (when > nds_timer) ? (s32)(when - nds_timer) : 0;
 	}
 
 	s32 computeNext(EventID id)
 	{
-		return handlers[id].computeNext(handlers[id].instance) - nds_timer;
+		// Both sides are u64: for an event already due this subtraction wraps to a
+		// huge value, which then truncates to a bogus s32 and poisons the list.
+		// Compare first, and clamp a due event to 0.
+		const u64 when = handlers[id].computeNext(handlers[id].instance);
+		return (when > nds_timer) ? (s32)(when - nds_timer) : 0;
 	}
 
     void reSchedule() {
@@ -1375,6 +1388,12 @@ struct Sequencer
             return kNever; 
         }
 
+
+        // outEvent was never written, so exec_cpu's updateEventCycle(nextEvent, ...)
+        // charged the elapsed cycles to whatever id happened to be in that variable,
+        // never the event it had just waited on. The head event kept its distance
+        // forever and nds_timer stopped advancing.
+        outEvent = static_cast<EventID>(currentHead);
         return nodes[currentHead].next_time;
     }
 
@@ -1651,6 +1670,7 @@ static void execHardware_hblank()
 static void execHardware_hstart_vblankEnd()
 {
 	sequencer.nds_vblankEnded = true;
+	g_dbg_vbl++;
 
 	// Per-frame host work: input, frame pacing, FPS counter.
 	extern void desmume_cycle();
@@ -1909,8 +1929,10 @@ u64 Sequencer::findNext()
 
 void Sequencer::execHardware()
 {
+	g_dbg_ts = dispcnt.timestamp; g_dbg_en = dispcnt.enabled ? 1 : 0;
 	if (dispcnt.isTriggered())
 	{
+		g_dbg_hw_disp++;
 
 		//		IF_DEVELOPER(DEBUG_statistics.sequencerExecutionCounters[1]++);
 
@@ -2147,6 +2169,7 @@ void exec_cpu()
 #if PROFILER_ENABLED
 	const u32 _prof_t9 = sceKernelGetSystemTimeLow();
 #endif
+	g_dbg_cpu++;
 	NDS_ReschedulePtr = 0;
 
 	s32next = sequencer.popNext(nextEvent);
@@ -2170,21 +2193,35 @@ void exec_cpu()
 	// Gating on min(arm9, arm7) ended the loop as soon as the ARM7 fell behind,
 	// which is what the old 's32next = timer + 1' patch was papering over -- it
 	// made time crawl one cycle per iteration.
+	// The head event can be due (s32next <= arm9) while execHardware still sees
+	// nds_timer < timestamp -- they disagree by a cycle. The while below then
+	// never runs, so nothing advances time and nothing fires. Step nds_timer to
+	// the event so execHardware can consume it on the next pass.
+	if (s32next <= arm9)
+	{
+		nds_timer = nds_timer_base + arm9 + 1;
+		nds_arm9_timer = nds_timer;
+		nds_arm7_timer = nds_timer_base + arm7;
+		return;
+	}
+
 	while (arm9 < s32next && NDS_ReschedulePtr == 0)
 	{
-		if (arm9 <= timer)   // ARM9 is the one behind
+		// Step whichever CPU is behind. Comparing against the other one directly
+		// (rather than a 'timer' captured earlier) is what keeps both moving: the
+		// stale copy let one CPU sit above it and never get another turn.
+		if (arm9 <= arm7)
 		{
 #if PROFILER_ENABLED
 			g_prof_a9_calls++;
 #endif
 			if (!(NDS_ARM9.freeze & CPU_FREEZE_WAIT_IRQ) && !nds.freezeBus && !NDS_ARM9.idle_loop)
 			{
-				arm9 += armcpu_exec<ARMCPU_ARM9, NDS_USE_JIT>();
+				g_dbg_a9++; arm9 += armcpu_exec<ARMCPU_ARM9, NDS_USE_JIT>();
 			}
 			else
 			{
-				// idle_loop: the JIT detected a spin only the next scheduled
-				// event can break, so jump straight to it.
+				// Waiting on an IRQ or a frozen bus: skip to the next event.
 				nds.idleCycles[0] += (s32next - arm9);
 				arm9 = s32next;
 
@@ -2192,8 +2229,7 @@ void exec_cpu()
 					nds.freezeBus &= ~1;
 			}
 		}
-
-		if (arm7 <= timer)   // ARM7 is behind: give it a turn
+		else
 		{
 			const bool frozen =
 				!!(NDS_ARM7.freeze & (CPU_FREEZE_WAIT_IRQ | CPU_FREEZE_OVERCLOCK_HACK));
@@ -2201,18 +2237,18 @@ void exec_cpu()
 			if (!frozen && !nds.freezeBus)
 			{
 				// ARM7 runs at half the ARM9 clock -> <<1 to convert to ARM9 time.
-				arm7 += (armcpu_exec<ARMCPU_ARM7, NDS_USE_JIT>() << 1);
+				g_dbg_a7++; arm7 += (armcpu_exec<ARMCPU_ARM7, NDS_USE_JIT>() << 1);
 			}
 			else
 			{
+				// Frozen: charge the wait and let the ARM9 carry the loop.
 				const s32 prev = arm7;
 				arm7 = std::min(s32next, arm7 + kIrqWait);
 				nds.idleCycles[1] += (arm7 - prev);
 			}
 		}
 
-		timer = std::min(arm9, arm7);
-		nds_timer = nds_timer_base + timer;
+		nds_timer = nds_timer_base + std::min(arm9, arm7);
 	}
 
 	nds_timer = nds_timer_base + timer;
@@ -2245,6 +2281,7 @@ uint8_t *NDS_exec_code = ((uint8_t *)(SCRATCHPAD_ADDR + 0x1000));
 
 void exec_hw()
 {
+	g_dbg_hw++; loop_dbg_report();
 	// it should be begin to execute execHardware in the next frame,
 	// since there won't be anything for it to do (everything should be scheduled in the future)
 #if PROFILER_ENABLED
@@ -2306,6 +2343,7 @@ template<int PROCNUM> static void execHardware_interrupts_core()
 
 void execHardware_interrupts()
 {
+	g_dbg_irq++;
 	if (sequencer.nds_vblankEnded)
 	{
 		disp_fifo.head = disp_fifo.tail = 0;
