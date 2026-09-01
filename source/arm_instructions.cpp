@@ -6201,9 +6201,9 @@ TEMPLATE static u32 FASTCALL  OP_SWI(const u32 i)
 	//then it doesn't really make any sense to use the builtin SWI's since 
 	//the bios ones aren't getting called anyway
 
-	//HCF
-	/**
-	bool bypassBuiltinSWI = 
+	// Same NULL-swi_tab hazard as OP_SWI_THUMB: restoring this guard, which was
+	// safe to omit only while the ARM7 was HLE.
+	bool bypassBuiltinSWI =
 		(cpu->intVector == 0x00000000 && PROCNUM==0)
 		|| (cpu->intVector == 0xFFFF0000 && PROCNUM==1);
 
@@ -6211,14 +6211,10 @@ TEMPLATE static u32 FASTCALL  OP_SWI(const u32 i)
 
 	if(cpu->swi_tab && !bypassBuiltinSWI)
 	{
-	***/
 		swinum &= 0x1F;
 		return cpu->swi_tab[swinum]() + 3;
-	
-	//HCF
-	/***
-	} 
-	else 
+	}
+	else
 	{
 		// TODO (#1#): translocated SWI vectors 
 		// we use an irq thats not in the irq tab, as
@@ -6234,7 +6230,6 @@ TEMPLATE static u32 FASTCALL  OP_SWI(const u32 i)
 		cpu->next_instruction = cpu->R[15];
 		return 3;
 	}
-	**/
 }
 
 //-----------------------------------------------------------------------------

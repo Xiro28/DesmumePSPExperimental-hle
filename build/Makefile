@@ -25,7 +25,6 @@ $(SRCDIR)/matrix.o \
 $(SRCDIR)/mc.o \
 $(SRCDIR)/mic.o \
 $(SRCDIR)/MMU.o \
-$(SRCDIR)/loopdbg.o \
 $(SRCDIR)/NDSSystem.o \
 $(SRCDIR)/path.o \
 $(SRCDIR)/readwrite.o \

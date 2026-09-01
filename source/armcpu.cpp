@@ -751,15 +751,14 @@ extern "C" uint32_t run_block_chain(armcpu_t*, uintptr_t);
 template<int PROCNUM, bool jit>
 u32 armcpu_exec()
 {
-	// constexpr: the JIT path is ARM9-only, so the ARM7 instantiation must not
-	// even reference JIT_COMPILED_FUNC (its table has no ARM7 rows).
 	if constexpr(jit)
 	{
 		ARMPROC.instruct_adr &= ARMPROC.CPSR.bits.T?0xFFFFFFFE:0xFFFFFFFC;
 		ArmOpCompiled code_block = (ArmOpCompiled)JIT_COMPILED_FUNC(ARMPROC.instruct_adr, PROCNUM);
 
-		// Stay inside compiled code across block boundaries instead of returning
-		// to this dispatcher for every block.
+		// run_block_chain takes the CPU it should run, so it serves both. Only
+		// ARM9 blocks actually chain, though: ARM7 blocks are emitted to return
+		// here after one block, since the chaining dispatcher is ARM9-only.
 		if (code_block)
 			return run_block_chain(&ARMPROC, (uintptr_t)code_block);
 

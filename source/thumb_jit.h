@@ -26,7 +26,7 @@ void emitThumbOP(opcode& op){
             conditional(
                 emit_li(psp_a0, op.imm);
                 u32 _op = emit_SlideDelay();
-                emit_jal(jump_to_linked_bc<true>);
+                emit_jal((jump_to_linked_bc<true, PROCNUM>));
                 emit_Write32(_op);)
         }
         break;
@@ -43,7 +43,7 @@ void emitThumbOP(opcode& op){
             currentBlock.JumpOP = true;
 
             emit_li(psp_a0, op.imm);
-            emit_jal(jump_to_linked_uncod_thumb);
+            emit_jal(jump_to_linked_uncod_thumb<PROCNUM>);
             emit_nop();
         }
         break;

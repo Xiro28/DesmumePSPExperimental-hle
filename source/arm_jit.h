@@ -37,32 +37,30 @@ struct JIT_struct
 	uintptr_t MAIN_MEM[4*1024*1024/2];
 	uintptr_t SWIRAM[0x8000/2];
 	uintptr_t ARM9_ITCM[0x8000/2];
-	uintptr_t ARM9_LCDC[0xA4000/2];
+	// ARM9_LCDC (code executed straight out of VRAM in LCDC mode, 1.34MB of
+	// table) is dropped: BSS is the binding constraint on PSP and executing from
+	// VRAM is vanishingly rare. Its rows map to NULL, so such code falls back to
+	// the interpreter instead of being compiled -- correct, just not accelerated.
 	uintptr_t ARM9_BIOS[0x8000/2];
+	// ARM7-only executable regions. Restored (with the per-CPU JIT_MEM below)
+	// from upstream so the ARM7 can run under the JIT too. The ARM7 sees
+	// 0x03xxxxxx differently from the ARM9 -- shared SIWRAM in the low half,
+	// its own non-shared ERAM in the high half -- so it genuinely needs its own
+	// table rather than a filter over the ARM9's.
+	uintptr_t ARM7_BIOS[0x4000/2];
+	uintptr_t ARM7_ERAM[0x10000/2];
+	uintptr_t ARM7_WIRAM[0x10000/2];
+	// ARM7_WRAM (VRAM allocated as ARM7 work RAM) dropped for the same reason as
+	// ARM9_LCDC above -- 512KB of table for a region games rarely execute from.
 
-	static uintptr_t *JIT_MEM[0x4000];
+	static uintptr_t *JIT_MEM[2][0x4000];
 };
 
 extern CACHE_ALIGN JIT_struct JIT;
-#define JIT_COMPILED_FUNC(adr, PROCNUM) JIT.JIT_MEM[((adr)&0x0FFFC000)>>14][((adr)&0x00003FFE)>>1]
-#define JIT_COMPILED_FUNC_PREMASKED(adr, PROCNUM, ofs) JIT.JIT_MEM[(adr)>>14][(((adr)&0x00003FFE)>>1)+ofs]
+#define JIT_COMPILED_FUNC(adr, PROCNUM) JIT.JIT_MEM[PROCNUM][((adr)&0x0FFFC000)>>14][((adr)&0x00003FFE)>>1]
+#define JIT_COMPILED_FUNC_PREMASKED(adr, PROCNUM, ofs) JIT.JIT_MEM[PROCNUM][(adr)>>14][(((adr)&0x00003FFE)>>1)+ofs]
 #define JIT_COMPILED_FUNC_KNOWNBANK(adr, bank, mask, ofs) JIT.bank[(((adr)&(mask))>>1)+ofs]
-// NOTE: JIT_MEM is an ARM9-only table (upstream had JIT_MEM[2][0x4000], one per
-// CPU, plus ARM7_BIOS/ERAM/WIRAM/WRAM blocks). Its 0x3X row maps 0x03xxxxxx via
-// the ARM9's view of SIWRAM, which is *not* how the ARM7 sees that region -- the
-// ARM7's non-shared IWRAM is a different block entirely. So an ARM7 write must
-// never be allowed to invalidate through this table: it would clobber unrelated
-// ARM9 entries. The ARM7 runs the interpreter, so it needs no invalidation at
-// all; PROCNUM 1 is simply excluded.
-//
-// The ARM7 still has to invalidate the *shared* regions it writes to, because
-// the ARM9 compiles code out of them: main RAM (0x02) and SIWRAM (0x03) when
-// WRAMCNT maps it to the ARM9. Its own non-shared IWRAM (0x0380xxxx and up) is
-// invisible to the ARM9 and must be left alone -- that is the range this table
-// would mis-map.
-#define JIT_ARM7_SHARED(adr) (((adr) >> 24) == 0x02 || (((adr) >> 24) == 0x03 && !((adr) & 0x00800000)))
-
-#define JIT_MAPPED(adr, PROCNUM) 	(((PROCNUM) == 0 || JIT_ARM7_SHARED(adr)) ? JIT.JIT_MEM[(adr)>>14] : NULL)
+#define JIT_MAPPED(adr, PROCNUM) JIT.JIT_MEM[PROCNUM][(adr)>>14]
 
 extern u32 saveBlockSizeJIT;
 

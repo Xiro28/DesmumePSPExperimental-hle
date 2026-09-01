@@ -1,5 +1,8 @@
 #include "blockdecoder.h"
 
+// Single definition; declared extern in blockdecoder.h (see the note there).
+uint32_t block_procnum = 0;
+
 #include "mips_code_emiter.h"
 #include "PSP/emit/psp_emit.h"
 #include "armcpu.h"
@@ -859,53 +862,61 @@ void EmitReadFunction(u32 addr)
 // — recursion grows the native stack one frame per taken branch (loops/calls
 // overflow it and corrupt memory). The block epilogue + continue_cpu_check
 // tail-jump to the target with no stack growth.
-template <bool execute>
+// These update the CPU that the block belongs to. They used to hardcode
+// NDS_ARM9, which was correct only while the JIT was ARM9-only; an ARM7 block
+// would have driven the ARM9's PC instead of its own.
+template <bool execute, int PROCNUM>
 u32 jump_to_linked_bc(u32 off)
 {
-    NDS_ARM9.R[15] += off;
-    NDS_ARM9.R[15] &= (0xFFFFFFFC | (NDS_ARM9.CPSR.bits.T << 1));
-    NDS_ARM9.next_instruction = NDS_ARM9.R[15];
-    NDS_ARM9.instruct_adr     = NDS_ARM9.R[15];
+    armcpu_t &proc = ARMPROC;
+    proc.R[15] += off;
+    proc.R[15] &= (0xFFFFFFFC | (proc.CPSR.bits.T << 1));
+    proc.next_instruction = proc.R[15];
+    proc.instruct_adr     = proc.R[15];
     return 3;
 }
 
-template <bool execute>
+template <bool execute, int PROCNUM>
 u32 jump_to_linked_blc(u32 off)
 {
-    NDS_ARM9.R[14] = NDS_ARM9.next_instruction;   // link register = return address
-    NDS_ARM9.R[15] += off;
-    NDS_ARM9.R[15] &= (0xFFFFFFFC | (NDS_ARM9.CPSR.bits.T << 1));
-    NDS_ARM9.next_instruction = NDS_ARM9.R[15];
-    NDS_ARM9.instruct_adr     = NDS_ARM9.R[15];
+    armcpu_t &proc = ARMPROC;
+    proc.R[14] = proc.next_instruction;   // link register = return address
+    proc.R[15] += off;
+    proc.R[15] &= (0xFFFFFFFC | (proc.CPSR.bits.T << 1));
+    proc.next_instruction = proc.R[15];
+    proc.instruct_adr     = proc.R[15];
     return 3;
 }
 
-template <bool execute>
+template <bool execute, int PROCNUM>
 u32 jump_to_linked(u32 addr)
 {
-    NDS_ARM9.CPSR.bits.T = BIT0(addr);
-    NDS_ARM9.R[15] = addr & (0xFFFFFFFC | (NDS_ARM9.CPSR.bits.T << 1));
-    NDS_ARM9.next_instruction = NDS_ARM9.R[15];
-    NDS_ARM9.instruct_adr     = NDS_ARM9.R[15];
+    armcpu_t &proc = ARMPROC;
+    proc.CPSR.bits.T = BIT0(addr);
+    proc.R[15] = addr & (0xFFFFFFFC | (proc.CPSR.bits.T << 1));
+    proc.next_instruction = proc.R[15];
+    proc.instruct_adr     = proc.R[15];
     return 3;
 }
 
-template <bool execute>
+template <bool execute, int PROCNUM>
 u32 jump_to_linked_br(u32 addr)
 {
-    NDS_ARM9.R[14] = NDS_ARM9.next_instruction;
-    NDS_ARM9.CPSR.bits.T = BIT0(addr);
-    NDS_ARM9.R[15] = addr & (0xFFFFFFFC | (NDS_ARM9.CPSR.bits.T << 1));
-    NDS_ARM9.next_instruction = NDS_ARM9.R[15];
-    NDS_ARM9.instruct_adr     = NDS_ARM9.R[15];
+    armcpu_t &proc = ARMPROC;
+    proc.R[14] = proc.next_instruction;
+    proc.CPSR.bits.T = BIT0(addr);
+    proc.R[15] = addr & (0xFFFFFFFC | (proc.CPSR.bits.T << 1));
+    proc.next_instruction = proc.R[15];
+    proc.instruct_adr     = proc.R[15];
     return 3;
 }
-
+template <int PROCNUM>
 u32 jump_to_linked_uncod_thumb(u32 addr)
 {
-    NDS_ARM9.R[15] += addr;
-    NDS_ARM9.next_instruction = NDS_ARM9.R[15];
-    NDS_ARM9.instruct_adr     = NDS_ARM9.R[15];
+    armcpu_t &proc = ARMPROC;
+    proc.R[15] += addr;
+    proc.next_instruction = proc.R[15];
+    proc.instruct_adr     = proc.R[15];
     return 1;
 }
 
@@ -956,6 +967,46 @@ void _write32(u32 addr, u32 val)
     _MMU_ARM9_write32(addr, val);
 }
 
+// ARM7 counterparts. The helpers above are ARM9-specific in three ways: DTCM
+// exists only on the ARM9, mmu_write_lut_arm9 describes the ARM9's memory map,
+// and the JIT invalidation they do is for ARM9 blocks. The ARM7 shares main RAM
+// (and SIWRAM, depending on WRAMCNT) with the ARM9, so its writes still have to
+// invalidate ARM9 blocks there -- but through the ARM7's own view.
+u32 _read32_arm7(u32 addr, u32 addr_mem)
+{
+    return _MMU_ARM7_read32(addr);
+}
+
+void _write16_arm7(u32 addr, u16 val)
+{
+    if (JIT_MAPPED(addr, ARMCPU_ARM7))
+        JIT_COMPILED_FUNC_PREMASKED(addr, ARMCPU_ARM7, 0) = 0;
+    // Main RAM is shared: an ARM7 write there can invalidate ARM9 code.
+    if ((addr >> 24) == 0x02)
+        JIT_COMPILED_FUNC_KNOWNBANK(addr, MAIN_MEM, _MMU_MAIN_MEM_MASK16, 0) = 0;
+    _MMU_ARM7_write16(addr, val);
+}
+
+void _write32_arm7(u32 addr, u32 val)
+{
+    if (JIT_MAPPED(addr, ARMCPU_ARM7))
+    {
+        JIT_COMPILED_FUNC_PREMASKED(addr, ARMCPU_ARM7, 0) = 0;
+        JIT_COMPILED_FUNC_PREMASKED(addr, ARMCPU_ARM7, 1) = 0;
+    }
+    if ((addr >> 24) == 0x02)
+    {
+        JIT_COMPILED_FUNC_KNOWNBANK(addr, MAIN_MEM, _MMU_MAIN_MEM_MASK32, 0) = 0;
+        JIT_COMPILED_FUNC_KNOWNBANK(addr, MAIN_MEM, _MMU_MAIN_MEM_MASK32, 1) = 0;
+    }
+    _MMU_ARM7_write32(addr, val);
+}
+
+// Pick the right helper for the block being compiled.
+#define JIT_READ32(PN)  ((PN) == ARMCPU_ARM9 ? (u32)_read32  : (u32)_read32_arm7)
+#define JIT_WRITE16(PN) ((PN) == ARMCPU_ARM9 ? (u32)_write16 : (u32)_write16_arm7)
+#define JIT_WRITE32(PN) ((PN) == ARMCPU_ARM9 ? (u32)_write32 : (u32)_write32_arm7)
+
 #include "FIFO.h"
 #include "NDSSystem.h"
 
@@ -1002,7 +1053,7 @@ void write_3D_fifo(u32 addr, u32 data)
     gfx3d_sendCommandToFIFO(data);
 }
 
-template <uint32_t size>
+template <uint32_t size, int PROCNUM>
 void write_dma(u32 val, u32 i, s32 shift_op, u32 type)
 {
 
@@ -1013,18 +1064,15 @@ void write_dma(u32 val, u32 i, s32 shift_op, u32 type)
     // resolves the register at compile time. That is part of a wider MMU rework
     // which is not ported here, so route through this tree's runtime-dispatched
     // signature instead -- same underlying registers, just resolved at run time.
-    MMU_new.write_dma(ARM9, size, adr, val);
+    MMU_new.write_dma(PROCNUM, size, adr, val);
 }
 
+template <int PROCNUM>
 void arm_halt_hack()
 {
-    static u32 prevIE = 0;
-    if (MMU.reg_IE[0] != prevIE) {
-        printf("WFI IE changed: %08X -> %08X (IF=%08X)\n", prevIE, MMU.reg_IE[0], MMU.gen_IF<0>());
-        prevIE = MMU.reg_IE[0];
-    }
-    NDS_ARM9.CPSR.bits.I = 0;
-	NDS_ARM9.freeze |= CPU_FREEZE_WAIT_IRQ;
+    armcpu_t &proc = ARMPROC;
+    proc.CPSR.bits.I = 0;
+	proc.freeze |= CPU_FREEZE_WAIT_IRQ;
 	NDS_Reschedule();
 }
 
@@ -1083,7 +1131,7 @@ void emitARMOP(opcode &op, const bool last_op)
             emit_li(psp_a3, op.preOpType);
 
             {
-                emit_jal((write_dma<32>));
+                emit_jal((write_dma<32, PROCNUM>));
             }
 
             emit_move(psp_a0, regs[0]););
@@ -1628,7 +1676,7 @@ void emitARMOP(opcode &op, const bool last_op)
 
             emit_movi(psp_v0, 1);
         conditional(
-            emit_jal(jump_to_linked_br<true>);
+            emit_jal((jump_to_linked_br<true, PROCNUM>));
             loadReg(psp_a0, op.rs1);) break;
     }
 
@@ -1653,7 +1701,7 @@ void emitARMOP(opcode &op, const bool last_op)
             if (!uncond) regman.flush_all(true);
             emit_li(psp_a0, op.imm);
             u32 op = emit_SlideDelay();
-            emit_jal(jump_to_linked_bc<true>);
+            emit_jal((jump_to_linked_bc<true, PROCNUM>));
             emit_Write32(op);)
     }
     break;
@@ -1680,7 +1728,7 @@ void emitARMOP(opcode &op, const bool last_op)
             if (!uncond) regman.flush_all(true);
             emit_li(psp_a0, op.imm);
             u32 op = emit_SlideDelay();
-            emit_jal(jump_to_linked_blc<true>);
+            emit_jal((jump_to_linked_blc<true, PROCNUM>));
             emit_Write32(op);)
     }
     break;
@@ -1696,7 +1744,7 @@ void emitARMOP(opcode &op, const bool last_op)
 
             emit_movi(psp_v0, 1);
         conditional(
-            emit_jal(jump_to_linked<true>);
+            emit_jal((jump_to_linked<true, PROCNUM>));
             loadReg(psp_a0, op.rs1);)
         /*int32_t regs[1] = {op.rs1};
 
@@ -1821,11 +1869,11 @@ void emitARMOP(opcode &op, const bool last_op)
                 if (OP_STRH == op._op) {
                     /*if (op.extra_flags & EXTFL_DIRECTMEMACCESS){
                         u32 op = emit_SlideDelay();
-                        emit_jal(_write16);
+                        emit_jal(JIT_WRITE16(PROCNUM));
                         emit_Write32(op);
                     }else*/
                     {
-                        emit_jal(_write16);
+                        emit_jal(JIT_WRITE16(PROCNUM));
                         emit_ins(psp_a0, psp_zero, 0, 0);
                     }
                 } else {
@@ -1883,13 +1931,13 @@ void emitARMOP(opcode &op, const bool last_op)
                         emit_beq(psp_zero, psp_zero, DONE);   // 23: -> DONE
                         emit_sw(psp_a1, psp_t1, 0);           // 24: delay slot: store word
                         // SLOW (25):
-                        emit_jal(_write32);                    // 25
+                        emit_jal(JIT_WRITE32(PROCNUM));                    // 25
                         emit_ins(psp_a0, psp_zero, 1, 0);     // 26: delay slot: align a0
                         // DONE (27):
                     }
                     else
                     {
-                        emit_jal(_write32);
+                        emit_jal(JIT_WRITE32(PROCNUM));
                         emit_ins(psp_a0, psp_zero, 1, 0);
                     }
                 }
@@ -2051,7 +2099,7 @@ void emitARMOP(opcode &op, const bool last_op)
                         emit_sll(regs[0], psp_a0, 3);
 
                         emit_move(psp_a1, psp_a0);
-                        emit_jal(_read32);
+                        emit_jal(JIT_READ32(PROCNUM));
                         emit_ins(psp_a1, psp_zero, 31, 22);
 
                         emit_rotrv(regs[0], psp_v0, regs[0]);
@@ -2092,10 +2140,10 @@ void emitARMOP(opcode &op, const bool last_op)
 
 
                         /*emit_move(psp_a1, psp_a0);
-                        emit_jal(_read32);
+                        emit_jal(JIT_READ32(PROCNUM));
                         emit_ins(psp_a1, psp_zero, 31, 22);
 
-                        emit_li(psp_a1, (u32)_read32);
+                        emit_li(psp_a1, JIT_READ32(PROCNUM));
                         emit_li(psp_a0, emit_getCurrAdr());
                         emit_jal(lastBeforeCrash);
                         emit_nop();*/
@@ -2197,7 +2245,7 @@ void emitARMOP(opcode &op, const bool last_op)
                 } else {
                     emit_move(psp_a0, psp_s5);
                     loadReg(psp_a1, b);
-                    emit_jal(_write32);
+                    emit_jal(JIT_WRITE32(PROCNUM));
                     emit_ins(psp_a0, psp_zero, 1, 0);     // word-align addr (delay slot)
                 }
 
@@ -2338,7 +2386,7 @@ void emitARMOP(opcode &op, const bool last_op)
 
     case OP_HALT_HACK:
     {
-        emit_jal(arm_halt_hack);
+        emit_jal(arm_halt_hack<PROCNUM>);
         emit_nop(); 
         break;
     }

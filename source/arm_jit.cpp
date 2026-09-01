@@ -49,7 +49,7 @@ bool full_block = false;
 
 CACHE_ALIGN JIT_struct JIT;
 
-uintptr_t *JIT_struct::JIT_MEM[0x4000] = {0};
+uintptr_t *JIT_struct::JIT_MEM[2][0x4000] = {{0}};
 
 // static u8 recompile_counts[(1<<26)/16];
 #include <cstdint>
@@ -285,8 +285,9 @@ static constexpr std::array<Function, 2> MICROCODE_FUNCTIONS = {
     Function(MICROCODE_WAIT_AGREEMENT, std::size(MICROCODE_WAIT_AGREEMENT), "MICROCODE_WAIT_AGREEMENT", hle_microcode_wait_agreement, 7),
 };
 
-static uintptr_t *JIT_MEM[32] = {
+static uintptr_t *JIT_MEM[2][32] = {
     // arm9
+    {
     /* 0X*/ DUP2(JIT.ARM9_ITCM),
     /* 1X*/ DUP2(JIT.ARM9_ITCM), // mirror
     /* 2X*/ DUP2(JIT.MAIN_MEM),
@@ -294,7 +295,7 @@ static uintptr_t *JIT_MEM[32] = {
     /* 4X*/ DUP2(NULL),
     /* 5X*/ DUP2(NULL),
     /* 6X*/ NULL,
-    JIT.ARM9_LCDC, // Plain ARM9-CPU Access (LCDC mode) (max 656KB)
+    NULL, // was JIT.ARM9_LCDC (LCDC-mode execution; table dropped, see arm_jit.h)
     /* 7X*/ DUP2(NULL),
     /* 8X*/ DUP2(NULL),
     /* 9X*/ DUP2(NULL),
@@ -303,10 +304,36 @@ static uintptr_t *JIT_MEM[32] = {
     /* CX*/ DUP2(NULL),
     /* DX*/ DUP2(NULL),
     /* EX*/ DUP2(NULL),
-    /* FX*/ DUP2(JIT.ARM9_BIOS)};
+    /* FX*/ DUP2(JIT.ARM9_BIOS)
+    },
+    // arm7 -- note 3X: the low half is shared SIWRAM, the high half is the
+    // ARM7's own ERAM. That asymmetry with the ARM9 map is why the two CPUs
+    // cannot share one table.
+    {
+    /* 0X*/ DUP2(JIT.ARM7_BIOS),
+    /* 1X*/ DUP2(NULL),
+    /* 2X*/ DUP2(JIT.MAIN_MEM),
+    /* 3X*/ JIT.SWIRAM,
+    JIT.ARM7_ERAM,
+    /* 4X*/ NULL,
+    JIT.ARM7_WIRAM,
+    /* 5X*/ DUP2(NULL),
+    /* 6X*/ NULL, // was JIT.ARM7_WRAM (table dropped, see arm_jit.h)
+    NULL,
+    /* 7X*/ DUP2(NULL),
+    /* 8X*/ DUP2(NULL),
+    /* 9X*/ DUP2(NULL),
+    /* AX*/ DUP2(NULL),
+    /* BX*/ DUP2(NULL),
+    /* CX*/ DUP2(NULL),
+    /* DX*/ DUP2(NULL),
+    /* EX*/ DUP2(NULL),
+    /* FX*/ DUP2(NULL)
+    }};
 
-static u32 JIT_MASK[32] = {
+static u32 JIT_MASK[2][32] = {
     // arm9
+    {
     /* 0X*/ DUP2(0x00007FFF),
     /* 1X*/ DUP2(0x00007FFF),
     /* 2X*/ DUP2(0x003FFFFF), // FIXME _MMU_MAIN_MEM_MASK
@@ -314,7 +341,7 @@ static u32 JIT_MASK[32] = {
     /* 4X*/ DUP2(0x00000000),
     /* 5X*/ DUP2(0x00000000),
     /* 6X*/ 0x00000000,
-    0x000FFFFF,
+    0x00000000, // ARM9_LCDC table dropped
     /* 7X*/ DUP2(0x00000000),
     /* 8X*/ DUP2(0x00000000),
     /* 9X*/ DUP2(0x00000000),
@@ -323,7 +350,30 @@ static u32 JIT_MASK[32] = {
     /* CX*/ DUP2(0x00000000),
     /* DX*/ DUP2(0x00000000),
     /* EX*/ DUP2(0x00000000),
-    /* FX*/ DUP2(0x00007FFF)};
+    /* FX*/ DUP2(0x00007FFF)
+    },
+    // arm7
+    {
+    /* 0X*/ DUP2(0x00003FFF),
+    /* 1X*/ DUP2(0x00000000),
+    /* 2X*/ DUP2(0x003FFFFF),
+    /* 3X*/ 0x00007FFF,
+    0x0000FFFF,
+    /* 4X*/ 0x00000000,
+    0x0000FFFF,
+    /* 5X*/ DUP2(0x00000000),
+    /* 6X*/ 0x00000000, // ARM7_WRAM table dropped
+    0x00000000,
+    /* 7X*/ DUP2(0x00000000),
+    /* 8X*/ DUP2(0x00000000),
+    /* 9X*/ DUP2(0x00000000),
+    /* AX*/ DUP2(0x00000000),
+    /* BX*/ DUP2(0x00000000),
+    /* CX*/ DUP2(0x00000000),
+    /* DX*/ DUP2(0x00000000),
+    /* EX*/ DUP2(0x00000000),
+    /* FX*/ DUP2(0x00000000)
+    }};
 
 static void init_jit_mem()
 {
@@ -332,8 +382,9 @@ static void init_jit_mem()
    if (inited)
       return;
 
-   for (int i = 0; i < 0x4000; i++)
-      JIT.JIT_MEM[i] = JIT_MEM[i >> 9] + (((i << 14) & JIT_MASK[i >> 9]) >> 1);
+   for (int proc = 0; proc < 2; proc++)
+      for (int i = 0; i < 0x4000; i++)
+         JIT.JIT_MEM[proc][i] = JIT_MEM[proc][i >> 9] + (((i << 14) & JIT_MASK[proc][i >> 9]) >> 1);
 
    
 
@@ -2079,7 +2130,9 @@ extern "C" {
    uint32_t*   g_freeze    = &NDS_ARM9.freeze;
    uint32_t*   g_freezebus = (uint32_t*)&nds.freezeBus;
    uint32_t*   g_instr_adr = &NDS_ARM9.instruct_adr;
-   uintptr_t** g_jit_mem   = JIT.JIT_MEM;
+   // The ARM9 row: everything in this block is for the ARM9-only chaining
+   // dispatcher, which never runs for ARM7 blocks.
+   uintptr_t** g_jit_mem   = JIT.JIT_MEM[ARMCPU_ARM9];
 }
 
 // --- JIT control flags (always compiled, independent of profiling) ---
@@ -2493,8 +2546,18 @@ void compile_basicblock(bool interpret_only = false)
 
    void *code_ptr = emit_GetPtr();
 
-   const bool isIdle = (interpret_only || !my_config.exp_idle_loop)
-                       ? false : currentBlock.isIdleLoop(thumb);
+   // Idle-loop detection is DISABLED: it deadlocks the ARM9 in this tree.
+   //
+   // isIdle is decided once, at compile time, but baked into the block as a
+   // constant that is re-stored on every execution. Once a block writes
+   // idle_loop=1, exec_cpu stops stepping the ARM9 -- and nothing ever clears
+   // the flag again (the only writes to false are at init and jit reset), so
+   // the block that would reset it can never run. Observed as a9=0 with the
+   // ARM9 frozen at 02058BE4 waiting on IPC-SYNC.
+   //
+   // Re-enabling this needs the flag re-evaluated at run time, not frozen into
+   // the block, plus a guaranteed path that clears it.
+   const bool isIdle = false;
 
    // StartCodeDump();
 
@@ -2575,7 +2638,34 @@ void compile_basicblock(bool interpret_only = false)
    }
 #endif
 
-   if (slot_taken) {
+   if (PROCNUM == ARMCPU_ARM7) {
+      // The block-chaining dispatcher is ARM9-only: continue_cpu_check and the
+      // emitted inline dispatch read the globals `arm9`/`s32next` and the
+      // g_* pointers, all of which refer to NDS_ARM9. Letting an ARM7 block
+      // chain would advance the ARM9's instruct_adr and bill ARM7 cycles to the
+      // ARM9's budget. So an ARM7 block accumulates its cycles and returns to
+      // armcpu_exec immediately; the exit stub itself is CPU-agnostic.
+#if JIT_CYCLES_IN_REG
+      if (blk_cycles <= 0x7FFFu)
+         emit_addiu(RCYC, RCYC, blk_cycles);
+      else {
+         emit_li(psp_t0, blk_cycles);
+         emit_addu(RCYC, RCYC, psp_t0);
+      }
+#else
+      emit_lui(psp_t9, DISP_HI(&executed_cycles));
+      emit_lw(psp_v1, psp_t9, DISP_LO(&executed_cycles));
+      if (blk_cycles <= 0x7FFFu)
+         emit_addiu(psp_v1, psp_v1, blk_cycles);
+      else {
+         emit_li(psp_t0, blk_cycles);
+         emit_addu(psp_v1, psp_v1, psp_t0);
+      }
+      emit_sw(psp_v1, psp_t9, DISP_LO(&executed_cycles));
+#endif
+      emit_j((u32)continue_cpu_dispatch_exit);
+      emit_nop();
+   } else if (slot_taken) {
       emit_inline_dispatch(blk_cycles, 0, slot_addr, slot_taken, taken_pc, (uint32_t)g_instr_adr);
    } else if (next_block) {
       emit_inline_dispatch(blk_cycles, next_block);
@@ -2996,7 +3086,9 @@ u32 arm_jit_compile()
       return f();
    }*/
 
-   if (emit_nitrosdk_func(pc, thumb))
+   // ARM9 only: the substituted microcode handlers operate on NDS_ARM9
+   // directly, so they must never stand in for an ARM7 block.
+   if (PROCNUM == ARMCPU_ARM9 && emit_nitrosdk_func(pc, thumb))
    {
       ArmOpCompiled code_block = (ArmOpCompiled)JIT_COMPILED_FUNC(ARMPROC.instruct_adr, PROCNUM);
       return code_block();
@@ -3332,8 +3424,10 @@ void arm_jit_reset(bool enable, bool suppress_msg)
       JITFREE(JIT.MAIN_MEM);
       JITFREE(JIT.SWIRAM);
       JITFREE(JIT.ARM9_ITCM);
-      JITFREE(JIT.ARM9_LCDC);
       JITFREE(JIT.ARM9_BIOS);
+      JITFREE(JIT.ARM7_BIOS);
+      JITFREE(JIT.ARM7_ERAM);
+      JITFREE(JIT.ARM7_WIRAM);
 #undef JITFREE
 
       memset(jit_mainmem_code, 0, sizeof(jit_mainmem_code));

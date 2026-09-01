@@ -163,7 +163,6 @@ extern void renderScreenFull();
 extern volatile u8 __attribute__((aligned(16))) *GPU_Screen;
 extern volatile u8 __attribute__((aligned(16))) *GPU_Screen_extra;
 
-extern u32 g_dbg_draw;
 void desmume_cycle()
 {
 	u16 pad = 0;
@@ -228,7 +227,6 @@ void desmume_cycle()
 		sceDmacMemcpy((void*)(0x04100000), (void*)&GPU_Screen[0], sz_SCR);
 		sceDmacMemcpy((void*)(0x04100000 + sz_SCR), (void*)&GPU_Screen_extra[0], sz_SCR);
 
-		g_dbg_draw++;
 		renderScreenFull();
 		EMU_SCREEN(false, false);   // draw both; frameskip is applied above
 	}

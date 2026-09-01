@@ -33,7 +33,12 @@
 #define RCYC   psp_s0
 #endif
 
-static uint32_t block_procnum;
+// Which CPU the block currently being compiled belongs to. This was `static`,
+// which in a header gives every translation unit its OWN copy: arm_jit.cpp set
+// its copy in arm_jit_compile(), while blockdecoder.cpp read a different one
+// that stayed 0 forever. Harmless while the JIT was ARM9-only (0 was always
+// right); with an ARM7 JIT it silently compiled ARM7 blocks against ARM9 state.
+extern uint32_t block_procnum;
 
 #define _ARMPROC (block_procnum ? NDS_ARM7 : NDS_ARM9)
 
@@ -284,6 +289,11 @@ class block{
 
             // Only safe to skip if IRQs are enabled — otherwise the loop can never exit via interrupt.
             if (_ARMPROC.CPSR.bits.I) return false;
+
+            // NOTE: this whole function is currently unreachable -- isIdle is
+            // hardcoded false in compile_basicblock (see the note there).
+            // Checking IME/IE here was not enough: the flag is frozen into the
+            // block at compile time, so it goes stale as soon as they change.
 
             // If there are any write or READ operations, the block isn’t idle.
             // A ReadOP means the loop polls memory (e.g. GXSTAT, VCOUNT) — skipping

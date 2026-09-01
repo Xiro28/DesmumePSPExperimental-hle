@@ -1033,25 +1033,24 @@ TEMPLATE static  u32 FASTCALL OP_SWI_THUMB(const u32 i)
 	//then it doesn't really make any sense to use the builtin SWI's since 
 	//the bios ones aren't getting called anyway
 	
-	//HCF
-	/***
-	bool bypassBuiltinSWI = 
+	// This guard was commented out in both the -hle tree and here, which was safe
+	// only while the ARM7 was HLE and never executed a SWI. swi_tab is NULL
+	// whenever the BIOS routines are used (SWIFromBIOS), so calling through it
+	// unconditionally jumps to swinum*4 -- a real ARM7 Thumb SWI then lands on a
+	// tiny address like 0x0000000c and takes the emulator down.
+	bool bypassBuiltinSWI =
 		(cpu->intVector == 0x00000000 && PROCNUM==0)
 		|| (cpu->intVector == 0xFFFF0000 && PROCNUM==1);
 
 	//printf("THUMB%c SWI %02X\t; %s\n", PROCNUM?'7':'9', (swinum & 0x1F), ARM_swi_names[PROCNUM][(swinum & 0x1F)]);
 
 	if(cpu->swi_tab && !bypassBuiltinSWI) {
-	***/
-		//zero 25-dec-2008 - in arm, we were masking to 0x1F. 
+		//zero 25-dec-2008 - in arm, we were masking to 0x1F.
 		//this is probably safer since an invalid opcode could crash the emu
 		//zero 30-jun-2009 - but they say that the ideas 0xFF should crash the device...
 		//u32 swinum = cpu->instruction & 0xFF;
 		swinum &= 0x1F;
-		return cpu->swi_tab[swinum]() + 3;  
-
-	//HCF
-	/***
+		return cpu->swi_tab[swinum]() + 3;
 	}
 	else {
 		// we use an irq thats not in the irq tab, as
@@ -1067,7 +1066,6 @@ TEMPLATE static  u32 FASTCALL OP_SWI_THUMB(const u32 i)
 		cpu->next_instruction = cpu->R[15];
 		return 3;
 	}
-	***/
 }
 
 //-----------------------------------------------------------------------------

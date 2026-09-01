@@ -610,10 +610,6 @@ void GameInfo::closeROM()
 
 #include <unordered_map>
 
-extern u32 g_dbg_hw, g_dbg_cpu, g_dbg_irq, g_dbg_a9, g_dbg_a7, g_dbg_draw, g_dbg_vbl;
-extern u32 g_dbg_hw_disp, g_dbg_hw_none;
-extern u64 g_dbg_ts; extern u32 g_dbg_en;
-void loop_dbg_report(void);
 
 std::unordered_map<u32, u32> cached_rom;
 
@@ -1673,7 +1669,6 @@ static void execHardware_hblank()
 static void execHardware_hstart_vblankEnd()
 {
 	sequencer.nds_vblankEnded = true;
-	g_dbg_vbl++;
 
 	NDS_ReschedulePtr = true;
 
@@ -1929,10 +1924,8 @@ u64 Sequencer::findNext()
 
 void Sequencer::execHardware()
 {
-	g_dbg_ts = dispcnt.timestamp; g_dbg_en = dispcnt.enabled ? 1 : 0;
 	if (dispcnt.isTriggered())
 	{
-		g_dbg_hw_disp++;
 
 		//		IF_DEVELOPER(DEBUG_statistics.sequencerExecutionCounters[1]++);
 
@@ -2064,10 +2057,13 @@ bool nds_loadstate(EMUFILE* is, int size)
 }
 
 //these have not been tuned very well yet.
-// The JIT is ARM9-only in this tree. JIT_MEM has no ARM7 rows (see arm_jit.h),
-// so the ARM7 must stay on the interpreter -- it is the lighter of the two
-// anyway, and this is what makes the hybrid arrangement safe. Set the ARM9 flag
-// to false to take the JIT out of the picture when chasing a hang.
+// Both CPUs now run under the JIT: JIT_MEM is per-CPU again (JIT_MEM[2][0x4000],
+// with the ARM7's own BIOS/ERAM/WIRAM/WRAM blocks), and the codegen helpers that
+// used to hardcode NDS_ARM9 take the block's PROCNUM. ARM7 blocks do not join the
+// ARM9's block chain -- that dispatcher is ARM9-only -- so they return to
+// armcpu_exec after each block.
+// Set either flag to false to drop that CPU back to the interpreter, which is
+// the reference implementation and the right thing to do when chasing a hang.
 #define NDS_ARM9_USE_JIT true
 #define NDS_ARM7_USE_JIT false
 
@@ -2172,7 +2168,6 @@ void exec_cpu()
 #if PROFILER_ENABLED
 	const u32 _prof_t9 = sceKernelGetSystemTimeLow();
 #endif
-	g_dbg_cpu++;
 	NDS_ReschedulePtr = 0;
 
 	s32next = sequencer.popNext(nextEvent);
@@ -2212,7 +2207,7 @@ void exec_cpu()
 #endif
 			if (!(NDS_ARM9.freeze & CPU_FREEZE_WAIT_IRQ) && !nds.freezeBus && !NDS_ARM9.idle_loop)
 			{
-				g_dbg_a9++; arm9 += armcpu_exec<ARMCPU_ARM9, NDS_ARM9_USE_JIT>();
+				arm9 += armcpu_exec<ARMCPU_ARM9, NDS_ARM9_USE_JIT>();
 			}
 			else
 			{
@@ -2222,6 +2217,13 @@ void exec_cpu()
 
 				if (nds.freezeBus && gxFIFO.size < 255)
 					nds.freezeBus &= ~1;
+
+				// Safety net: idle_loop is written by compiled blocks and nothing
+				// else ever clears it, so a stale flag would park the ARM9 here
+				// forever. If an enabled interrupt is actually pending, the spin
+				// the JIT detected is over -- clear it and let the CPU run.
+				if (NDS_ARM9.idle_loop && (MMU.gen_IF<ARMCPU_ARM9>() & MMU.reg_IE[ARMCPU_ARM9]))
+					NDS_ARM9.idle_loop = false;
 			}
 		}
 		else
@@ -2232,7 +2234,7 @@ void exec_cpu()
 			if (!frozen && !nds.freezeBus)
 			{
 				// ARM7 runs at half the ARM9 clock -> <<1 to convert to ARM9 time.
-				g_dbg_a7++; arm7 += (armcpu_exec<ARMCPU_ARM7, NDS_ARM7_USE_JIT>() << 1);
+				arm7 += (armcpu_exec<ARMCPU_ARM7, NDS_ARM7_USE_JIT>() << 1);
 			}
 			else
 			{
@@ -2279,7 +2281,7 @@ uint8_t *NDS_exec_code = ((uint8_t *)(SCRATCHPAD_ADDR + 0x1000));
 
 void exec_hw()
 {
-	g_dbg_hw++; loop_dbg_report();
+
 	// it should be begin to execute execHardware in the next frame,
 	// since there won't be anything for it to do (everything should be scheduled in the future)
 #if PROFILER_ENABLED
@@ -2341,7 +2343,6 @@ template<int PROCNUM> static void execHardware_interrupts_core()
 
 void execHardware_interrupts()
 {
-	g_dbg_irq++;
 	if (sequencer.nds_vblankEnded)
 	{
 		disp_fifo.head = disp_fifo.tail = 0;
