@@ -48,6 +48,7 @@ enum
 /* Registers */
 typedef enum
 {
+	psp_null = -1,
 	psp_gr0,  psp_r0  = psp_gr0,  psp_zr = psp_gr0, psp_zero = psp_gr0, psp_gpr = psp_gr0,
 	psp_gr1,  psp_r1  = psp_gr1,  psp_at = psp_gr1,
 	psp_gr2,  psp_r2  = psp_gr2,  psp_v0 = psp_gr2,
@@ -878,7 +879,7 @@ inline bool is_u8(u32 v) { return (u8)v==(s32)v; }
 inline bool is_s16(u32 v) { return (s16)v==(s32)v; }
 inline bool is_u16(u32 v) { return (u16)v==(u32)v; }
 
-void emit_li(u32 reg,u32 data,u32 sz);
+void emit_li(u32 reg,u32 data,u32 sz = 2);
 //  | j label
 #define emit_j(_target) emit_jump(j, psp_absolute_target(_target))
 //  | jal label

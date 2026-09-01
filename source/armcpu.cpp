@@ -154,6 +154,8 @@ int armcpu_new( armcpu_t *armcpu, u32 id)
 	armcpu->SetCurrentMemoryInterface(NULL);
 	armcpu->SetCurrentMemoryInterfaceData(NULL);
 	
+	armcpu->idle_loop = false;
+
 	armcpu->post_ex_fn = NULL;
 	armcpu->post_ex_fn_data = NULL;
 	
@@ -235,9 +237,13 @@ void armcpu_t::ResetMemoryInterfaceToBase()
 void armcpu_t::changeCPSR()
 {
 	//but all it does is give them a chance to unleash by forcing an immediate reschedule
-	//TODO - we could actually set CPSR through here and look for a change in the I bit
-	//that would be a little optimization as well as a safety measure if we prevented setting CPSR directly
-	NDS_Reschedule();
+	//This is the optimization the old TODO here described: only an I (IRQ mask)
+	//bit change can unleash a pending interrupt, so a plain mode write need not
+	//tear the CPU out of its run loop.
+	if (old_CPSR.bits.I != CPSR.bits.I)
+		NDS_Reschedule();
+
+	old_CPSR = CPSR;
 }
 
 void armcpu_init(armcpu_t *armcpu, u32 adr)
@@ -257,7 +263,7 @@ void armcpu_init(armcpu_t *armcpu, u32 adr)
 	for(int i = 0; i < 16; ++i)
 		armcpu->R[i] = 0;
 	
-	armcpu->CPSR.val = armcpu->SPSR.val = SYS;
+	armcpu->old_CPSR.val = armcpu->CPSR.val = armcpu->SPSR.val = SYS;
 	
 	armcpu->R13_usr = armcpu->R14_usr = 0;
 	armcpu->R13_svc = armcpu->R14_svc = 0;
@@ -587,7 +593,11 @@ u32 TRAPUNDEF(armcpu_t* cpu)
 
 	if (((cpu->intVector != 0) ^ (cpu->proc_ID == ARMCPU_ARM9)))
 	{
-		armcpu_exception(&NDS_ARM9,EXCEPTION_UNDEFINED_INSTRUCTION);
+		// Take the exception on the CPU that actually hit it. Upstream hard-codes
+		// &NDS_ARM9 here; on the ARM7 that services the trap with the ARM9's
+		// intVector (0xFFFF0000), sending the ARM7 off into nowhere with
+		// LR=FFFF0000. Never exercised while the ARM7 was HLE.
+		armcpu_exception(cpu, EXCEPTION_UNDEFINED_INSTRUCTION);
 		return 4;
 	}
 	else
@@ -736,14 +746,24 @@ void arm_jit_sync()
 	armcpu_prefetch<1>();
 }
 
+extern "C" uint32_t run_block_chain(armcpu_t*, uintptr_t);
+
 template<int PROCNUM, bool jit>
 u32 armcpu_exec()
 {
-	if (jit)
+	// constexpr: the JIT path is ARM9-only, so the ARM7 instantiation must not
+	// even reference JIT_COMPILED_FUNC (its table has no ARM7 rows).
+	if constexpr(jit)
 	{
 		ARMPROC.instruct_adr &= ARMPROC.CPSR.bits.T?0xFFFFFFFE:0xFFFFFFFC;
-		ArmOpCompiled f = (ArmOpCompiled)JIT_COMPILED_FUNC(ARMPROC.instruct_adr, PROCNUM);
-		return f ? f() : arm_jit_compile<PROCNUM>();
+		ArmOpCompiled code_block = (ArmOpCompiled)JIT_COMPILED_FUNC(ARMPROC.instruct_adr, PROCNUM);
+
+		// Stay inside compiled code across block boundaries instead of returning
+		// to this dispatcher for every block.
+		if (code_block)
+			return run_block_chain(&ARMPROC, (uintptr_t)code_block);
+
+		return arm_jit_compile<PROCNUM>();
 	}
 
 	return armcpu_exec<PROCNUM>();

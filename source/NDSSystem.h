@@ -193,6 +193,24 @@ struct NDSSystem
 	u16 scr_touchX;
 	u16 scr_touchY;
 
+	// Nitro SDK version, detected by the JIT (check_nitro_sdk in arm_jit.cpp)
+	// when it recognises the SDK signature in a compiled block. Used to swap
+	// known SDK microcode functions for native implementations.
+	uint32_t sdk_version_major = 0;
+	uint32_t sdk_version_minor = 0;
+	uint32_t sdk_version_relstep = 0;
+	bool sdkValid = false;
+
+	inline bool is_twl_sdk()
+	{
+		return (sdk_version_major >= 5);
+	}
+
+	inline bool isSdkValid()
+	{
+		return sdkValid;
+	}
+
 	union{  
 
         struct{            

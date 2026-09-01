@@ -7,6 +7,7 @@ SRCDIR = ../source
 
 OBJS = $(SRCDIR)/arm_instructions.o \
 $(SRCDIR)/arm_jit.o \
+$(SRCDIR)/jit_difftest.o \
 $(SRCDIR)/armcpu.o \
 $(SRCDIR)/bios.o \
 $(SRCDIR)/blockdecoder.o \
@@ -81,6 +82,7 @@ $(SRCDIR)/PSP/vram.o \
 $(SRCDIR)/PSP/psp_sound.o \
 $(SRCDIR)/PSP/FastMemcpyPSP.o \
 $(SRCDIR)/PSP/DisableFPUExceptions.o \
+$(SRCDIR)/PSP/pspOpUtil.o \
 $(SRCDIR)/sndsdl.o \
 $(SRCDIR)/sndpsp.o \
 $(SRCDIR)/ctrlssdl.o \

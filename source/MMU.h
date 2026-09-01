@@ -826,6 +826,18 @@ dunno:
 	else return _MMU_ARM7_read32(addr);
 }
 
+// Per-region write dispatch entry. Indexed by addr >> 24 (256 entries = 16MB pages).
+// base == NULL means the region needs full slow-path dispatch. Used by the JIT's
+// inline write helpers in blockdecoder.cpp.
+struct WritePageEntry {
+	u8  *base;      // pointer to the backing buffer
+	u32  mask;      // raw byte mask within the region
+	u32  flags;     // WPE_JIT_INVAL: must invalidate JIT block cache on write
+};
+static const u32 WPE_JIT_INVAL = 0x1;
+extern WritePageEntry mmu_write_lut_arm9[256];
+void init_mmu_write_lut();
+
 FORCEINLINE void _MMU_write08(const int PROCNUM, const MMU_ACCESS_TYPE AT, const u32 addr, u8 val)
 {
 	//CheckMemoryDebugEvent(DEBUG_EVENT_WRITE,AT,PROCNUM,addr,8,val);

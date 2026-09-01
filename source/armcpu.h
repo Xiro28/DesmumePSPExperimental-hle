@@ -22,6 +22,7 @@
 #include "types.h"
 #include "bits.h"
 #include "MMU.h"
+#include "NDSSystem.h"
 
 #define CODE(i)     (((i)>>25)&0x7)
 #define OPCODE(i)   (((i)>>21)&0xF)
@@ -264,6 +265,10 @@ struct armcpu_t
 
 	u32 R[16]; //16
 	Status_Reg CPSR;  //80
+	// Previous CPSR, so changeCPSR() can reschedule only when the I (IRQ mask)
+	// bit actually flips instead of on every mode write. The JIT emits hardcoded
+	// offsets into this struct, so this field's position must not move.
+	Status_Reg old_CPSR;
 	Status_Reg SPSR;
 	
 	void SetControlInterface(const armcpu_ctrl_iface *theCtrlInterface);
@@ -293,7 +298,6 @@ struct armcpu_t
 	u32 R8_fiq, R9_fiq, R10_fiq, R11_fiq, R12_fiq, R13_fiq, R14_fiq;
 	Status_Reg SPSR_svc, SPSR_abt, SPSR_und, SPSR_irq, SPSR_fiq;
 
-	bool idle_loop;   // set by the JIT when a block is a pure spin
 	u32 intVector;
 	u8 LDTBit;  //1 : ARMv5 style 0 : non ARMv5 (earlier)
 	
@@ -302,6 +306,7 @@ struct armcpu_t
 	u8 intrWaitARM_state;
 
 	BOOL BIOS_loaded;
+	bool idle_loop;   // set by the JIT when a block is a pure spin
 
 	u32 (* *swi_tab)();
 
@@ -366,9 +371,13 @@ template<int PROCNUM, bool jit> u32 armcpu_exec();
 void setIF(int PROCNUM, u32 flag);
 char* decodeIntruction(bool thumb_mode, u32 instr);
 
-static INLINE void NDS_makeIrq(int PROCNUM, u32 num)
+// Inlined body of setIF(): raising an IRQ is hot enough that the call and the
+// reschedule matter. Keep in sync with setIF() in armcpu.cpp.
+static FORCEINLINE void NDS_makeIrq(int PROCNUM, u32 num)
 {
-	setIF(PROCNUM,1<<num);
+	MMU.reg_IF_bits[PROCNUM] |= 1<<num;
+
+	NDS_Reschedule();
 }
 
 #endif

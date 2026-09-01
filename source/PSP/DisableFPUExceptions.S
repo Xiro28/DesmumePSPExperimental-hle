@@ -13,61 +13,9 @@ _DisableFPUExceptions:
     .set pop 
 
 
-.global  set_op_logic_flags 		
-.set noat 
-.set noreorder
-
-set_op_logic_flags:
-    # N
-    SRL  $8, $2, 31
-    INS  $28, $8, 7, 1  
-
-    # Z 
-    SLTIU $8, $2, 1
-    JR   $31           
-    INS  $28, $8, 6, 1 
-  
-
-.global  set_sub_flags 		
-.set noat  
-.set noreorder
-
-set_sub_flags: 
-
-    # $28 = flags (4 = V, 5 = C, 6 = Z, 7 = N)
-
-    # C
-    SLTU $8, $2, $4     
-    INS  $28, $8, 5, 1   
-
-    # N
-    SRL  $12, $2, 31
-    INS  $28, $12, 7, 1  
-
-    # Z 
-    SLTIU $8, $2, 1
-    INS  $28, $8, 6, 1   
-
-    # V
-    XOR $10, $4, $5       
-    XOR $11, $2, $5 
-    AND $10, $11, $10      
-    EXT $8, $10, 31, 1   # size 0 is illegal; V is the sign bit, so size 1
-    JR   $31           
-    INS  $28, $8, 4, 1   
-
-
-.global  set_and_flags 		
-.set noat 
-.set noreorder
-
-set_and_flags:
-    SRL  $8, $2, 31
-    INS  $28, $8, 7, 1
-
-    SLTIU $8, $2, 1
-    INS  $28, $8, 6, 1
-     
-    SLT $8, $4, $5
-    JR $31
-    INS  $28, $8, 4, 1
+# NOTE: set_op_logic_flags / set_sub_flags / set_and_flags used to be appended
+# here. They are the JIT's flag helpers and belong in pspOpUtil.S, which now
+# provides them (plus set_add_flags and asm_fast_wrt32). The copies here were an
+# older revision -- set_sub_flags in particular computed C and V differently --
+# and would have silently won at link time over the versions the ported JIT was
+# difftested against.

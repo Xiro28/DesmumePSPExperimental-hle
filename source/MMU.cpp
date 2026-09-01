@@ -1153,12 +1153,33 @@ void MMU_Reset()
 	MMU_timing.arm9dataCache.Reset();
 }
 
+WritePageEntry mmu_write_lut_arm9[256];
+
+void init_mmu_write_lut()
+{
+	memset(mmu_write_lut_arm9, 0, sizeof(mmu_write_lut_arm9));
+
+	// ITCM mirrors at 0x00xxxxxx and 0x01xxxxxx (ARM9, 32KB)
+	mmu_write_lut_arm9[0x00] = {MMU.ARM9_ITCM, 0x7FFF, 0};
+	mmu_write_lut_arm9[0x01] = {MMU.ARM9_ITCM, 0x7FFF, 0};
+
+	// MAIN_MEM at 0x02xxxxxx -- mask is dynamic (4/8/16 MB), needs JIT invalidation
+	mmu_write_lut_arm9[0x02] = {MMU.MAIN_MEM, _MMU_MAIN_MEM_MASK, WPE_JIT_INVAL};
+
+	// SWIRAM (0x03) has dynamic WRAMCNT bank-switching -> slow path
+	// IO    (0x04) needs hardware register dispatch     -> slow path
+	// PAL   (0x05) small, accessed via ARM9_VMEM        -> slow path
+	// VRAM  (0x06) has runtime bank switching           -> slow path
+	// OAM   (0x07) small, within ARM9_VMEM              -> slow path
+}
+
 void SetupMMU(bool debugConsole, bool dsi) {
 	if(debugConsole) _MMU_MAIN_MEM_MASK = 0x7FFFFF;
 	else _MMU_MAIN_MEM_MASK = 0x3FFFFF;
 	if(dsi) _MMU_MAIN_MEM_MASK = 0xFFFFFF;
 	_MMU_MAIN_MEM_MASK16 = _MMU_MAIN_MEM_MASK & ~1;
 	_MMU_MAIN_MEM_MASK32 = _MMU_MAIN_MEM_MASK & ~3;
+	init_mmu_write_lut();
 }
 
 

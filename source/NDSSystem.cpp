@@ -2064,9 +2064,12 @@ bool nds_loadstate(EMUFILE* is, int size)
 }
 
 //these have not been tuned very well yet.
-// Set to false to run both CPUs through the interpreter (much slower, but it
-// takes the JIT out of the picture when chasing a hang).
-#define NDS_USE_JIT false
+// The JIT is ARM9-only in this tree. JIT_MEM has no ARM7 rows (see arm_jit.h),
+// so the ARM7 must stay on the interpreter -- it is the lighter of the two
+// anyway, and this is what makes the hybrid arrangement safe. Set the ARM9 flag
+// to false to take the JIT out of the picture when chasing a hang.
+#define NDS_ARM9_USE_JIT true
+#define NDS_ARM7_USE_JIT false
 
 const int kIrqWait = 4000;
 const int kMaxWork = 4000;
@@ -2209,7 +2212,7 @@ void exec_cpu()
 #endif
 			if (!(NDS_ARM9.freeze & CPU_FREEZE_WAIT_IRQ) && !nds.freezeBus && !NDS_ARM9.idle_loop)
 			{
-				g_dbg_a9++; arm9 += armcpu_exec<ARMCPU_ARM9, NDS_USE_JIT>();
+				g_dbg_a9++; arm9 += armcpu_exec<ARMCPU_ARM9, NDS_ARM9_USE_JIT>();
 			}
 			else
 			{
@@ -2229,7 +2232,7 @@ void exec_cpu()
 			if (!frozen && !nds.freezeBus)
 			{
 				// ARM7 runs at half the ARM9 clock -> <<1 to convert to ARM9 time.
-				g_dbg_a7++; arm7 += (armcpu_exec<ARMCPU_ARM7, NDS_USE_JIT>() << 1);
+				g_dbg_a7++; arm7 += (armcpu_exec<ARMCPU_ARM7, NDS_ARM7_USE_JIT>() << 1);
 			}
 			else
 			{

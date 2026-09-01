@@ -21,17 +21,10 @@
 
 // JIT-vs-interpreter differential test (source/jit_difftest.cpp), run from the
 // ROM-selection menu via TRIANGLE.
-// The new JIT's tunables live in arm_jit.cpp in the -hle tree, which is not
-// ported yet. Define them here so the menu still links; porting the JIT will
-// move these to their real home.
-extern "C" const int g_jit_cycles_in_reg = 0;
-unsigned char jit_opt_constprop  = 1;
-unsigned char jit_opt_condmerge  = 1;
-unsigned char jit_opt_thumbflags = 1;
-unsigned char jit_opt_fastmem    = 1;
-
-// jit_difftest is not ported to this tree yet (it belongs with the JIT work).
-static void jit_difftest_run_force() {}
+// g_jit_cycles_in_reg and the jit_opt_* toggles are defined in arm_jit.cpp;
+// jit_difftest_run_force() lives in jit_difftest.cpp. Both are now ported, so
+// the placeholder definitions that used to sit here are gone.
+extern "C" void jit_difftest_run_force();
 
 //---------------------------------------------------------------------
 // SETTINGS structure (SETTINGS / MAX_SETTINGS now declared in FrontEnd.h so
