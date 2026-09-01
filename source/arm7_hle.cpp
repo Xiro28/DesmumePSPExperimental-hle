@@ -69,30 +69,29 @@ void SendIPCReply(u32 service, u32 data, u32 flag)
 // awake it is authoritative for everything not in that mask.
 // ---------------------------------------------------------------------------
 
-// Services still handled by the HLE. Touchscreen (0x6), powerman (0x8) and
-// cart save (0xB) are deliberately left to the real ARM7 core.
-// IMPORTANT: only claim a service whose handler ALWAYS replies.
+// Services the HLE claims. Claiming consumes the message, so the real ARM7 core
+// never sees it -- and several handlers silently do nothing for inputs they do
+// not model (an empty else branch, an early `if (flag)`, an unhandled default).
+// That would leave the ARM9 waiting for a reply nobody can send.
 //
-// Claiming consumes the message, so the real ARM7 core never sees it. Several
-// of the handlers below silently do nothing for inputs they do not model --
-// OnIPCRequest_Cart() has an empty else branch, others start with
-// `if (flag) break;`. In the -hle tree that merely meant "unimplemented",
-// because the HLE was the only responder. Here it means the ARM9 waits forever
-// for a reply nobody will send: the message is gone and the core cannot answer
-// it either. That is a deadlock, not a missing feature.
-//
-// So the mask starts at sound only -- the service you actually want offloaded,
-// and the one whose handler is complete. Add others only after checking that
-// their handler replies on every path.
+// HLE_TryClaimIPC() makes the claim reversible: if the handler produces no
+// reply, the message is put back and the core gets it. So a service can be
+// listed here without auditing every path through its handler -- an unmodelled
+// request degrades into "the core handles it" rather than a deadlock.
 u32 HLE_SERVICE_MASK =
-      (1u << 0x7);  // sound (Nitro HLE)
+      (1u << 0x6)   // touchscreen
+    | (1u << 0x7);  // sound (Nitro HLE)
 
-// Not claimed, and why:
-//   0x4 firmware   } handlers bail out on some inputs without replying
-//   0x5 RTC        } (see the note above) -- would deadlock the ARM9
-//   0x9 mic        }
-//   0xD cart       } OnIPCRequest_Cart: empty else branch
-//   0x6 touch, 0x8 powerman, 0xB cart save: deliberately the core's job
+// Not claimed:
+//   0xD cart -- do NOT add. OnIPCRequest_Cart() replies SendIPCReply(0xD, 0x1)
+//     with a `// TODO other shito?` next to it: a placeholder success for a
+//     service that is how the game loads data off the cartridge. Because it
+//     does reply, the rollback below confirms the claim, so the game proceeds
+//     believing it has data it never received. Bisected: sound alone works,
+//     sound+touch works, adding this breaks boot. It needs a real handler
+//     written before it can be offloaded; the core does the job properly today.
+//   0x8 powerman, 0xB cart save: deliberately the real core's job
+//   0x4 firmware, 0x5 RTC, 0x9 mic: not needed, the core handles them
 //   0xA wifi: needs a WIFI_HLE sequencer event this tree does not have
 
 bool HLE_handles(u32 service)
@@ -665,21 +664,22 @@ void OnIPCRequest_Sound(u32 data)
         else
         {
             Sound_Engine = 1;
-            printf("HLE: Peach Engine\n");
+            printf("HLE: Peach sound engine -- no HLE for it, sound goes to the ARM7 core\n");
             //Sound_Peach::Reset();
+
+            // Stop claiming sound entirely. The rollback below would keep this
+            // game working anyway, but it would pay a claim-and-roll-back on
+            // every sound message forever; dropping the service does it once.
+            HLE_SERVICE_MASK &= ~(1u << 0x7);
         }
     }
 
     if (Sound_Engine == 0) return Sound_Nitro::OnIPCRequest(data);
 
     // Sound_Engine == 1 is the Peach engine, whose HLE was never written (the
-    // call below is commented out upstream too). Claiming the message and then
-    // not replying would hang the ARM9, so hand this game's sound back to the
-    // real ARM7 core by dropping the service from the mask. The message we are
-    // holding is lost, but the ARM9 retries -- one dropped request beats a
-    // deadlock, and every later one goes to the core.
-    HLE_SERVICE_MASK &= ~(1u << 0x7);
-    printf("HLE: Peach sound engine not implemented -- handing sound to the ARM7 core\n");
+    // call below is commented out upstream too). Falling through without a reply
+    // is now safe and correct: HLE_TryClaimIPC() sees no reply, rolls the message
+    // back and lets the real ARM7 core handle it.
    // if (Sound_Engine == 1) return Sound_Peach::OnIPCRequest(data);
 }
 
@@ -725,6 +725,48 @@ void OnIPCRequest_Mic(u32 data)
 volatile bool HLE_IPCPending = false;
 
 // Returns true if the HLE took the message.
+// Can the absence of an IPC reply be used to detect "this handler did not deal
+// with the request"? Only for services that reply to every single message.
+//
+// It cannot in general, and getting this wrong is worse than not rolling back at
+// all: it hands the core a message the HLE has already acted on, so both handle
+// it. Sound is the clearest case -- Sound_Nitro deliberately never replies over
+// IPC, it writes a completion counter into shared memory that the game polls
+// (see the comment at hle_sound_nitro.cpp:1721). Touch and cart-save also
+// accumulate several words and only reply on the last one.
+static bool HLE_ReplyMeansHandled(u32 service)
+{
+    switch (service)
+    {
+    case 0x6:   // touchscreen: every completed request replies; partial ones
+                // are mid-sequence, which the caller checks separately
+    case 0xD:   // cart: OnIPCRequest_Cart replies or does nothing at all
+        return true;
+
+    default:
+        return false;   // sound (0x7) and anything else: no reply is normal
+    }
+}
+
+// True when a handler is legitimately mid-sequence: it consumed a word and did
+// not reply because the request is not complete yet, not because it could not
+// handle it. Those must not be rolled back -- the handler already recorded the
+// word, so replaying it would count it twice.
+static bool HLE_RequestInProgress(u32 service)
+{
+    switch (service)
+    {
+    case 0x6:   // touchscreen: accumulates words until the (1<<24) "go" bit
+        return TS_Status == 1 || TS_Status == 3;
+
+    case 0xB:   // cart save: SM_DataPos walks a multi-word command
+        return SM_DataPos != 0;
+
+    default:
+        return false;
+    }
+}
+
 static bool HLE_TryClaimIPC()
 {
     void OnIPCRequest();
@@ -749,12 +791,77 @@ static bool HLE_TryClaimIPC()
     if (!HLE_handles(service))
         return false;   // belongs to the real ARM7 core -- leave it alone
 
-    const u8 before = ipc_fifo[ARMCPU_ARM9].size;
+    // Claim it as a transaction. Several HLE handlers silently do nothing for
+    // inputs they do not model (an empty else branch, an early `if (flag)`, an
+    // unhandled default). In the -hle tree that just meant "unimplemented",
+    // because the HLE was the only responder. Here consuming without replying
+    // would hang the ARM9 waiting for an answer nobody can give -- the message
+    // is gone, so the real ARM7 core cannot answer it either.
+    //
+    // So: remember the reply-FIFO depth, run the handler, and if it produced no
+    // reply, put the message back and let the core have it. That makes an
+    // unmodelled request degrade into "the core handles it" instead of a
+    // deadlock, and means a service can be claimed without auditing every path
+    // through its handler.
+    const u8 head_before  = ipc_fifo[ARMCPU_ARM9].head;
+    const u8 size_before  = ipc_fifo[ARMCPU_ARM9].size;
+    const u8 reply_before = ipc_fifo[ARMCPU_ARM7].size;
+
     OnIPCRequest();
+
+    const bool consumed = ipc_fifo[ARMCPU_ARM9].size < size_before;
+    const bool replied  = ipc_fifo[ARMCPU_ARM7].size > reply_before;
+
+    if (consumed && !replied && HLE_ReplyMeansHandled(service))
+    {
+        // Roll back: restore head/size so the message is queued again. Nothing
+        // else has run in between -- OnIPCRequest() is synchronous and the ARM7
+        // is not executing during this call -- so the slot still holds our word.
+        //
+        // Exception: a partial request. Some handlers legitimately accumulate
+        // several words and only reply once the last one arrives (the
+        // touchscreen's (1<<24) "go" bit, the cart-save state machine). Those
+        // recorded state, so replaying the word would double it. Detect them by
+        // asking whether the handler is mid-sequence.
+        if (!HLE_RequestInProgress(service))
+        {
+            ipc_fifo[ARMCPU_ARM9].head = head_before;
+            ipc_fifo[ARMCPU_ARM9].size = size_before;
+
+            // IPC_FIFOrecv() also updated both IPCFIFOCNT words (it may have set
+            // RECVEMPTY/SENDEMPTY on what it thought was the last word) and can
+            // have raised a send-empty IRQ. Restoring head/size does not undo
+            // that, so recompute the empty/full bits from the queue we just put
+            // back. A spurious send-empty IRQ is harmless -- the ARM7 rechecks
+            // the register -- but leaving RECVEMPTY set on a non-empty FIFO
+            // would make the core skip the message we just handed it.
+            u16 cnt9 = IPCFIFOCnt9;
+            u16 cnt7 = IPCFIFOCnt7;
+
+            cnt9 &= ~(IPCFIFOCNT_SENDEMPTY | IPCFIFOCNT_SENDFULL);
+            cnt7 &= ~(IPCFIFOCNT_RECVEMPTY | IPCFIFOCNT_RECVFULL);
+
+            if (ipc_fifo[ARMCPU_ARM9].size == 0)
+            {
+                cnt9 |= IPCFIFOCNT_SENDEMPTY;
+                cnt7 |= IPCFIFOCNT_RECVEMPTY;
+            }
+            else if (ipc_fifo[ARMCPU_ARM9].size > 15)
+            {
+                cnt9 |= IPCFIFOCNT_SENDFULL;
+                cnt7 |= IPCFIFOCNT_RECVFULL;
+            }
+
+            IPCFIFOCnt9 = cnt9;
+            IPCFIFOCnt7 = cnt7;
+
+            return false;   // hand it to the real ARM7 core
+        }
+    }
 
     // Only report success if the message was actually consumed, so a request
     // that could not be serviced can never turn into an infinite drain loop.
-    return ipc_fifo[ARMCPU_ARM9].size < before;
+    return consumed;
 }
 
 // Drain every message the HLE owns, called from execHardware -- i.e. between
@@ -869,10 +976,11 @@ void OnIPCRequest()
 
 void StartScanline(u16 line)
 {
-    // Touchscreen auto-sampling is HLE service 0x6, which the real ARM7 core now
-    // owns (see HLE_SERVICE_MASK). Replying here as well would inject a reply the
-    // ARM7 never asked for.
-    if (arm7_core_active || !HLE_handles(0x6))
+    // Auto-sampling only runs when the HLE actually owns touch: otherwise the
+    // real ARM7 core does its own sampling and a reply from here would be one
+    // the ARM9 never asked for. TS_Status is only ever 2 if an HLE-handled
+    // "setup auto sampling" request set it up, so that is the real gate.
+    if (!HLE_handles(0x6) || TS_Status != 2)
         return;
 
     for (int i = 0; i < TS_NumSamples; i++)

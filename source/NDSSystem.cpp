@@ -1876,7 +1876,12 @@ static void execHardware_hstart()
 	
 	//trigger hstart dmas
 	
+
 	triggerDma(EDMAMode_HStart);
+
+	// Used by the ARM7 HLE: drives touchscreen auto-sampling. No-op unless the
+	// HLE owns touch and a game asked for auto-sampling.
+	StartScanline(nds.hw_status.VCount);
 
 	if(nds.hw_status.VCount<192)
 	{
