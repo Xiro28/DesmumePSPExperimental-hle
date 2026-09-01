@@ -3088,11 +3088,11 @@ u32 arm_jit_compile()
 
    // ARM9 only: the substituted microcode handlers operate on NDS_ARM9
    // directly, so they must never stand in for an ARM7 block.
-   if (PROCNUM == ARMCPU_ARM9 && emit_nitrosdk_func(pc, thumb))
+   /*if (PROCNUM == ARMCPU_ARM9 && emit_nitrosdk_func(pc, thumb))
    {
       ArmOpCompiled code_block = (ArmOpCompiled)JIT_COMPILED_FUNC(ARMPROC.instruct_adr, PROCNUM);
       return code_block();
-   }
+   }*/
 
    //return op_decode[PROCNUM][thumb]();
 

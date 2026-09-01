@@ -112,6 +112,8 @@ public:
 	static u32 addr_size_for_old_save_type(int bupmem_type);
 
 	static u32 pad_up_size(u32 startSize);
+	// Read straight out of the backing file; used by the ARM7 HLE cart-save path.
+	void loadToBuffer(u8* buf, u32 offset, u32 size);
 	void raw_applyUserSettings(u32& size, bool manual = false);
 
 	u32 trim(void *buf, u32 size);

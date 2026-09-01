@@ -75,6 +75,29 @@ void IPC_FIFOsend(u8 proc, u32 val)
 	if(cnt_r&IPCFIFOCNT_RECVIRQEN)
 		NDS_makeIrq(proc_remote, IRQ_BIT_IPCFIFO_RECVNONEMPTY);
 
+	// Hybrid HLE: the ARM9 just posted a request. The HLE claims it ONLY if the
+	// service is one it still owns (HLE_SERVICE_MASK); anything else is left in
+	// the FIFO untouched for the real ARM7 core to read.
+	//
+	// This split is what makes both halves coexist. IPC_FIFOrecv() is
+	// destructive -- it advances head and decrements size -- so whoever reads a
+	// message takes it away from the other. The -hle tree sidestepped that by
+	// only running the HLE while the ARM7 core was frozen; here the core always
+	// runs, so the ownership is decided per service instead of per mode.
+	// The invariant is unchanged: for any one service, exactly one of the two
+	// answers, and neither ever sees the other's messages.
+	// Do NOT service it inline here. OnIPCRequest() calls IPC_FIFOrecv() and
+	// then SendIPCReply() -> IPC_FIFOsend(), which re-enters this very function
+	// and rewrites the two IPCFIFOCNT words this call has just written, from
+	// inside it. It also runs after the ARM9's receive IRQ above was already
+	// raised, so the ARM9 could wake on a FIFO the HLE is still draining.
+	// Instead just flag it and let the sequencer drain it between instructions.
+	if (proc == ARMCPU_ARM9)
+	{
+		extern volatile bool HLE_IPCPending;
+		HLE_IPCPending = true;
+	}
+
 	NDS_Reschedule();
 }
 

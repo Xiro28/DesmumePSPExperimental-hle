@@ -1642,6 +1642,47 @@ static void CalculateTouchPressure(int pressurePercent, u16 &z1, u16& z2)
 
 }
 
+// Power-management SPI device, exposed for the ARM7 HLE. This tree keeps the
+// same logic inline in MMU_writeToSPIData() for the normal SPI path; these two
+// entry points let the HLE drive the device directly, without going through a
+// synthesised SPI transfer.
+u8 pwm_val = 0;
+
+u8 MMU_readPowerMan()
+{
+	return pwm_val;
+}
+
+void MMU_writePowerMan(u8 val, bool hold)
+{
+	if (!hold)
+		MMU.powerMan_CntRegWritten = FALSE;
+
+	if (hold && (!MMU.powerMan_CntRegWritten))
+	{
+		MMU.powerMan_CntReg = val;
+		MMU.powerMan_CntRegWritten = TRUE;
+		pwm_val = 0;
+	}
+	else
+	{
+		u32 regid = MMU.powerMan_CntReg & 0x07;
+
+		if (MMU.powerMan_CntReg & 0x80)
+		{
+			// read
+			pwm_val = MMU.powerMan_Reg[regid];
+		}
+		else
+		{
+			const u8 RegMasks[8] = {0x7f, 0x00, 0x01, 0x03, 0x0f, 0x00, 0x00, 0x00};
+			MMU.powerMan_Reg[regid] = (MMU.powerMan_Reg[regid] & ~RegMasks[regid]) | (val & RegMasks[regid]);
+		}
+
+		MMU.powerMan_CntRegWritten = FALSE;
+	}
+}
+
 void FASTCALL MMU_writeToSPIData(u16 val)
 {
 

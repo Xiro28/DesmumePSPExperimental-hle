@@ -627,6 +627,12 @@ void BackupDevice::reset_hardware()
 	motionFlag = MOTION_FLAG_NONE;
 }
 
+void BackupDevice::loadToBuffer(u8* buf, u32 offset, u32 size)
+{
+	fpMC->fseek(offset, SEEK_SET);
+	fpMC->fread(buf, size);
+}
+
 void BackupDevice::reset()
 {
 	reset_hardware();

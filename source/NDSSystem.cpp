@@ -43,6 +43,7 @@
 #include "bios.h"
 #include "debug.h"
 #include "FIFO.h"
+#include "arm7_hle.h"
 #include "readwrite.h"
 #include "registers.h"
 #include "debug.h"
@@ -97,6 +98,15 @@ PSP_SECTION(me_write)
 
 PSP_SECTION_END(sc_write)
 PSP_SECTION_END(me_write)
+
+// ARM7 HLE sound (Nitro), implemented in hle_sound_nitro.cpp.
+namespace Sound_Nitro
+{
+	extern void OnIPCRequest(u32 data);
+	extern void Reset();
+	extern void Process(u32 param);
+	extern void OnAlarm(u32 num);
+}
 
 namespace DLDI
 {
@@ -1187,6 +1197,9 @@ enum EventID
 	TIMER_11,
 	TIMER_12,
 	TIMER_13,
+	// ARM7 HLE services (see arm7_hle.cpp). Only the ones the HLE still owns
+	// need an event; touch/powerman/cart-save belong to the real ARM7 core.
+	HLE_AUDIO,
 	EVENT_COUNT
 };
 
@@ -1195,6 +1208,7 @@ struct Sequencer
 	bool nds_vblankEnded;
 
 	TSequenceItem dispcnt;
+	TSequenceItem hle_audio;   // ARM7 HLE sound (Nitro) tick
 	TSequenceItem wifi;
 	TSequenceItem_divider divider;
 	TSequenceItem_sqrtunit sqrtunit;
@@ -1435,6 +1449,7 @@ struct Sequencer
 		REGISTER_BASIC_EVENT(DISP_CNT, dispcnt);
 		REGISTER_BASIC_EVENT(DIVIDER, divider);
 		REGISTER_BASIC_EVENT(SQRT_UNIT, sqrtunit);
+		REGISTER_BASIC_EVENT(HLE_AUDIO, hle_audio);
 	}
 
 	void init();
@@ -1599,6 +1614,8 @@ static void initSchedule()
 //				= 33513982 cycles per second
 // 				= 33.513982 cycles per microsecond
 const u64 kWifiCycles = 67;//34*2;
+// ARM7 HLE sound tick period. Matches the -hle tree.
+const u64 kAudioCycles = 174592;
 //(this isn't very precise. I don't think it needs to be)
 
 void Sequencer::init()
@@ -1614,6 +1631,11 @@ void Sequencer::init()
 	dispcnt.timestamp = 0;
 
 	gxfifo.enabled = false;
+
+	// ARM7 HLE sound tick. The HLE owns IPC service 0x7, so it has to be driven
+	// on its own schedule -- the real ARM7 core never runs this code.
+	hle_audio.enabled = true;
+	hle_audio.timestamp = kAudioCycles;
 
 	dma_0_0.controller = &MMU_new.dma[0][0];
 	dma_0_1.controller = &MMU_new.dma[0][1];
@@ -1924,6 +1946,10 @@ u64 Sequencer::findNext()
 
 void Sequencer::execHardware()
 {
+	// Service ARM7 HLE IPC requests here, not from inside IPC_FIFOsend (see the
+	// note there): replying re-enters that function and rewrites its registers.
+	HLE_DrainIPC();
+
 	if (dispcnt.isTriggered())
 	{
 
@@ -1982,6 +2008,13 @@ void Sequencer::execHardware()
 	if (divider.isTriggered()){
 		divider.exec();
 		sequencer.removeFromList<DIVIDER>();
+	}
+
+	if (hle_audio.isTriggered())
+	{
+		Sound_Nitro::Process(1);
+		hle_audio.timestamp = nds_timer + kAudioCycles;
+		sequencer.updateEvent<HLE_AUDIO, true>();
 	}
 
 
@@ -2169,6 +2202,11 @@ void exec_cpu()
 	const u32 _prof_t9 = sceKernelGetSystemTimeLow();
 #endif
 	NDS_ReschedulePtr = 0;
+
+	// Also drain here: execHardware only runs on scheduled events, but the ARM9
+	// often posts an IPC request and then spins waiting for the reply, which
+	// would otherwise not arrive until the next event fires.
+	HLE_DrainIPC();
 
 	s32next = sequencer.popNext(nextEvent);
 
@@ -2743,6 +2781,9 @@ void NDS_Reset()
 	if(!IsEmu()) J_EXECUTE_ME_ONCE(&renderScreen, (int)frameSkipper.ShouldSkip2D());
 
 	resetUserInput();
+
+	// Reset the ARM7 HLE layer (IPC state machines, sound, wifi).
+	HLE_Reset();
 	
 	nds.hw_status.val = 0;
 	nds.freezeBus = 0;

@@ -7,6 +7,9 @@ SRCDIR = ../source
 
 OBJS = $(SRCDIR)/arm_instructions.o \
 $(SRCDIR)/arm_jit.o \
+$(SRCDIR)/arm7_hle.o \
+$(SRCDIR)/hle_sound_nitro.o \
+$(SRCDIR)/wifi_hle.o \
 $(SRCDIR)/jit_difftest.o \
 $(SRCDIR)/armcpu.o \
 $(SRCDIR)/bios.o \
