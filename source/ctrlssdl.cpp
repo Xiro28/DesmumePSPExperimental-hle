@@ -116,7 +116,7 @@ screen_to_touch_range( signed long scr, float size_ratio) {
 static void set_mouse_coord(signed long x,signed long y)
 {
   if(x<0) x = 0; else if(x>255) x = 255;
-  if(y<0) y = 0; else if(y>192) y = 192;
+  if(y<0) y = 0; else if(y>191) y = 191;
   mouse.x = x;
   mouse.y = y;
   //mouse.psp_x = mouse.x;
@@ -247,9 +247,14 @@ process_ctrls_event(u16 &keypad)
 
 	  if (pad.Buttons & PSP_CTRL_HOME && !select_combo) {
 		Menu();
-	  }	else if (pad.Buttons & PSP_CTRL_SELECT) {
-	  	mouse.click = TRUE;
-	  }	else{
+	  }	else {
+			if (pad.Buttons & PSP_CTRL_SELECT)
+				mouse.click = TRUE;
+
+			// The pad registers must keep being refreshed while touching. This
+			// used to be the else-branch of the SELECT test, so holding the
+			// stylus down froze every button -- and, more importantly, stopped
+			// the per-frame EXTKEYIN write the ARM7 polls.
 			u16	nds_pad	= (0 |
 				(((pad.Buttons & default_psp_cfg_h[0]) ? 0 : 0x80) >> 7) |
 				(((pad.Buttons & default_psp_cfg_h[1]) ? 0 : 0x80) >> 6) |

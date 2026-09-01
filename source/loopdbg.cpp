@@ -4,6 +4,7 @@
 #include "MMU.h"
 #include "armcpu.h"
 #include "NDSSystem.h"
+#include "FIFO.h"
 #include <pspkernel.h>
 #include <pspthreadman.h>
 #include <stdio.h>
@@ -30,10 +31,12 @@ void loop_dbg_report(void)
         (int)s32next, (int)arm9, (int)arm7,
         (unsigned)nds.hw_status.VCount,
         (unsigned)NDS_ARM9.instruct_adr, (unsigned)NDS_ARM7.instruct_adr);
-    printf("[loop2] fired=%u ts=%u timer=%u diff=%d en=%u none=%u\n",
-        (unsigned)g_dbg_hw_disp, (unsigned)g_dbg_ts, (unsigned)nds_timer,
-        (int)((s64)g_dbg_ts - (s64)nds_timer), (unsigned)g_dbg_en,
-        (unsigned)g_dbg_hw_none);
+    printf("[loop2] IME9=%u IE9=%08X IF9=%08X | IME7=%u IE7=%08X IF7=%08X | a7pc=%08X a7r0=%08X a7r1=%08X a7r2=%08X a7r3=%08X a7lr=%08X\n",
+        (unsigned)MMU.reg_IME[0], (unsigned)MMU.reg_IE[0], (unsigned)MMU.gen_IF<0>(),
+        (unsigned)MMU.reg_IME[1], (unsigned)MMU.reg_IE[1], (unsigned)MMU.gen_IF<1>(),
+        (unsigned)NDS_ARM7.instruct_adr,
+        (unsigned)NDS_ARM7.R[0], (unsigned)NDS_ARM7.R[1], (unsigned)NDS_ARM7.R[2],
+        (unsigned)NDS_ARM7.R[3], (unsigned)NDS_ARM7.R[14]);
     g_dbg_hw_disp = g_dbg_hw_none = 0;
 
     g_dbg_hw = g_dbg_cpu = g_dbg_irq = g_dbg_a9 = g_dbg_a7 = g_dbg_draw = g_dbg_vbl = 0;

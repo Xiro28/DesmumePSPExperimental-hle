@@ -942,7 +942,10 @@ struct TSequenceItem_Timer : public TSequenceItem
 	FORCEINLINE void exec()
 	{
 		//		IF_DEVELOPER(DEBUG_statistics.sequencerExecutionCounters[13+procnum*4+num]++);
-		u8 *regs = MMU.ARM9_REG;
+		// The -hle tree hardcodes ARM9_REG here because its ARM7 is HLE and has no
+		// timers. With a real ARM7 that reads the wrong TMxCNT, so its timer IRQ
+		// enable bit is never seen and IF7 stays 0 forever.
+		u8 *regs = (procnum == ARMCPU_ARM9) ? MMU.ARM9_REG : MMU.ARM7_REG;
 		bool first = true;
 		// we'll need to check chained timers..
 		for (int i = num; i < 4; i++)
@@ -1672,9 +1675,6 @@ static void execHardware_hstart_vblankEnd()
 	sequencer.nds_vblankEnded = true;
 	g_dbg_vbl++;
 
-	// Per-frame host work: input, frame pacing, FPS counter.
-	extern void desmume_cycle();
-	desmume_cycle();
 	NDS_ReschedulePtr = true;
 
 	//turn off vblank status bit
@@ -2156,7 +2156,7 @@ void exec_cpu()
 	nds_timer = nds_timer_base + armtime;
 
 	nds_arm9_timer = nds_timer_base + arm9;
-	nds_arm9_timer = nds_timer_base + arm7;
+	nds_arm7_timer = nds_timer_base + arm7;
 	//nds_arm7_timer = nds_timer_base + arm7;
 
 	
@@ -2187,23 +2187,15 @@ void exec_cpu()
 	// is behind -- upstream's armInnerLoop scheme. Running the ARM7 in a burst
 	// instead deadlocks the pair: they talk over IPC, so the ARM9 must get a turn
 	// to answer while the ARM7 waits.
-	s32 timer = std::min(arm9, arm7);
-
 	// Run until the ARM9 reaches the next event, as upstream and the fork both do.
-	// Gating on min(arm9, arm7) ended the loop as soon as the ARM7 fell behind,
-	// which is what the old 's32next = timer + 1' patch was papering over -- it
-	// made time crawl one cycle per iteration.
-	// The head event can be due (s32next <= arm9) while execHardware still sees
-	// nds_timer < timestamp -- they disagree by a cycle. The while below then
-	// never runs, so nothing advances time and nothing fires. Step nds_timer to
-	// the event so execHardware can consume it on the next pass.
+	// The head event can already be due (s32next <= arm9) while execHardware still
+	// sees nds_timer < timestamp -- they disagree by a cycle, so the while below
+	// would not run and nothing would advance. Charge one cycle and fall through
+	// to the common exit, which still runs updateEventCycle: the early return that
+	// used to be here skipped it, so the head event never got its distance scaled
+	// down and s32next drifted negative, freezing both CPUs for good.
 	if (s32next <= arm9)
-	{
-		nds_timer = nds_timer_base + arm9 + 1;
-		nds_arm9_timer = nds_timer;
-		nds_arm7_timer = nds_timer_base + arm7;
-		return;
-	}
+		s32next = arm9 + 1;
 
 	while (arm9 < s32next && NDS_ReschedulePtr == 0)
 	{
@@ -2251,7 +2243,10 @@ void exec_cpu()
 		nds_timer = nds_timer_base + std::min(arm9, arm7);
 	}
 
-	nds_timer = nds_timer_base + timer;
+	// NOTE: do NOT reassign nds_timer from a pre-loop snapshot here. That rewound
+	// nds_timer to the start of the slice while nds_arm9_timer was set forward
+	// just below, so the two drifted apart on every call until computeNext
+	// produced a negative s32next and the system froze.
 
 	/*printf("Status: %s %d cycles, %d idle cycles. Bus %s\n",
 	NDS_ARM9.freeze & CPU_FREEZE_WAIT_IRQ ? "waiting for IRQ" : "idle",
@@ -2351,6 +2346,11 @@ void execHardware_interrupts()
 		// Events parked with pending=1 (addToEvent / updateEvent<...,false>) only
 		// come back on the ordered list here. Without this the GX FIFO event never
 		// returns and 3D stops being processed.
+		// Per-frame host work: input, frame pacing, the draw. The fork runs it
+		// here, once per completed frame.
+		extern void desmume_cycle();
+		desmume_cycle();
+
 		sequencer.resolve_pendings();
 
 		sequencer.nds_vblankEnded = false;
@@ -2954,11 +2954,16 @@ void NDS_setPad(bool R,bool L,bool D,bool U,bool T,bool S,bool B,bool A,bool Y,b
 // ctrlssdl uses NDS_applyFinalInputDirect(), which never runs that.
 void NDS_setTouchPosDirect(u16 x, u16 y)
 {
-	nds.adc_touchX = NDS_getADCTouchPosX(x);
-	nds.adc_touchY = NDS_getADCTouchPosY(y);
-
+	// NDS_getADCTouchPos*() expect screen coords already shifted left by 4 (see
+	// the scrX_lsl4 parameter, which it shifts back down). Passing the raw x/y
+	// divided every touch by 16, parking the ADC reading -- which is what the
+	// TSC actually reports to the ARM7 -- near the top-left corner. Only the
+	// HLE ARM7 got away with it, since it read scr_touch* instead.
 	nds.scr_touchX = x << 4;
 	nds.scr_touchY = y << 4;
+
+	nds.adc_touchX = NDS_getADCTouchPosX(nds.scr_touchX);
+	nds.adc_touchY = NDS_getADCTouchPosY(nds.scr_touchY);
 	nds.hw_status.Touching = 1;
 }
 
@@ -3035,7 +3040,13 @@ void NDS_applyFinalInputDirect(u16 pad, u16 padExt)
 		}
 	}
 
-	padExt |= (((u16 *)MMU.ARM7_REG)[0x136 >> 1] & 0x0070);
+	// Preserve bits 4 and 5 only. Bit 6 (PENIRQ) must NOT be carried over: the
+	// REG_EXTKEYIN read handler in MMU.cpp generates it live from
+	// nds.hw_status.Touching (active low). Including it in the mask fed that
+	// generated value back into storage, so once a touch cleared bit 6 nothing
+	// ever set it again -- PENIRQ stayed asserted and the ARM7 saw the pen as
+	// permanently down. Harmless under HLE, where the ARM7 never read this.
+	padExt |= (((u16 *)MMU.ARM7_REG)[0x136 >> 1] & 0x0030);
 
 	((u16 *)MMU.ARM7_REG)[0x136 >> 1] = (u16)padExt;
 }
