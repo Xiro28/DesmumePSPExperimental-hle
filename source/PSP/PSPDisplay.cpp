@@ -340,6 +340,33 @@ static inline u16 scale5551(u16 c, int num, int den)
 }
 
 // Render one full frame of the split-screen menu.
+// Names for the per-CPU JIT mode setting (0..3). Without this the in-game
+// settings list fell through to "%d" for modes 2/3 and, worse, printed 0/1 as
+// OFF/ON -- which reads as "JIT disabled" when it actually means Full JIT.
+const char* GetJitModeText(int v)
+{
+    switch (v % 5) {
+    case 0:  return "0 Full JIT";       // everything compiled (fastest)
+    case 1:  return "1 JIT ARM only";   // ARM compiled, Thumb interpreted
+    case 2:  return "2 ITP->1st frame"; // interpret, compile after frame 1
+    case 3:  return "3 All Interp";     // block cache kept, all ops interpreted
+    default: return "4 ITP->DTCM";      // interpret, compile once DTCM moves
+    }
+}
+
+
+// Same problem as GetJitModeText: "ARM7 HLE Mode" is not a boolean, so values
+// 0/1 would print as OFF/ON (reading as "HLE disabled" when 0 actually means
+// sound-HLE) and 2/3 as bare numbers.
+const char* GetHleModeText(int v)
+{
+    switch (v % 4) {
+    case 0:  return "0 Core+Snd HLE";  // core runs; HLE answers sound only
+    case 1:  return "1 Core+Snd+Tch";  // core runs; HLE answers sound + touch
+    case 2:  return "2 Core Only";     // core runs; HLE answers nothing
+    default: return "3 No Core (HLE)"; // core STOPPED; HLE answers everything
+    }
+}
 void DrawRomMenu(char* file, f_list* list, int total)
 {
     // ── Original State Logic ──
@@ -425,9 +452,25 @@ void DrawRomMenu(char* file, f_list* list, int total)
     {
         char hbuf[48];
         snprintf(hbuf, sizeof(hbuf), "%d / %d", (total > 0 ? menu_romSel + 1 : 0), total);
-        QT(210, 16, 0.45f, C_NAME, hbuf);
-        snprintf(hbuf, sizeof(hbuf), "BAT %d%%", scePowerGetBatteryLifePercent());
-        QT(412, 16, 0.45f, C_NAME, hbuf);
+        QT(200, 16, 0.45f, C_NAME, hbuf);
+
+        // Clock, so it is visible without leaving the menu.
+        ScePspDateTime tm;
+        if (sceRtcGetCurrentClockLocalTime(&tm) >= 0) {
+            snprintf(hbuf, sizeof(hbuf), "%02d:%02d", tm.hour, tm.minute);
+            QT(272, 16, 0.45f, C_SUB, hbuf);
+        }
+
+        // Battery: green normally, amber under 30%, red under 15%, and a marker
+        // while charging -- readable at a glance instead of just a number.
+        const int bat = scePowerGetBatteryLifePercent();
+        const bool charging = scePowerIsBatteryCharging() != 0;
+        const u32 batCol = charging   ? 0xFF66DD66
+                         : (bat < 15) ? 0xFF5555FF
+                         : (bat < 30) ? 0xFF55CCFF
+                                      : C_NAME;
+        snprintf(hbuf, sizeof(hbuf), "%s%d%%", charging ? "+" : "", bat < 0 ? 0 : bat);
+        QT(430, 16, 0.45f, batCol, hbuf);
     }
 
     const int CT_Y = 30, CT_H = 212;            // content band: 30..242
@@ -1298,6 +1341,10 @@ void DrawRomSettings(int sel, int tab)
             snprintf(valbuf, sizeof(valbuf), "%s", GetLanguageText(arr[idx].value));
         else if (strcmp(arr[idx].name, "FPS Cap") == 0)
             snprintf(valbuf, sizeof(valbuf), "%s", GetFPSCapText(arr[idx].value));
+        else if (strstr(arr[idx].name, "JIT Mode") != NULL)
+            snprintf(valbuf, sizeof(valbuf), "%s", GetJitModeText(arr[idx].value));
+        else if (strstr(arr[idx].name, "HLE Mode") != NULL)
+            snprintf(valbuf, sizeof(valbuf), "%s", GetHleModeText(arr[idx].value));
         else if (arr[idx].value == 0 || arr[idx].value == 1)
             snprintf(valbuf, sizeof(valbuf), "%s", arr[idx].value ? "ON" : "OFF");
         else

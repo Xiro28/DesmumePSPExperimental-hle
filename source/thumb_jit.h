@@ -66,6 +66,56 @@ void emitThumbOP(opcode& op){
         break;
 
         //TODO ADD reg_alloc.end at the end of the opcde to store the temp reg (in case the static one are full)
+        // Thumb LSL/LSR/ASR by an immediate. Mirrors OP_LSL/OP_LSR/OP_ASR in
+        // thumb_instructions.cpp: sets N, Z and (except LSL #0) C; never V.
+        // The amount==0 encodings are distinct instructions in Thumb --
+        //   LSL #0 = plain move, C untouched
+        //   LSR #0 = LSR #32 -> Rd = 0,          C = Rm>>31
+        //   ASR #0 = ASR #32 -> Rd = sign(Rm),   C = Rm>>31
+        // Nonzero amounts take C from the last bit shifted out:
+        //   LSL: bit (32-amt) ; LSR/ASR: bit (amt-1)
+        // NOTE: the Thumb front-end has its OWN emitter (this switch), separate
+        // from the ARM one in blockdecoder.cpp -- adding an IR op there is not
+        // enough, it must be handled here too or it hits the default and aborts.
+        case OP_SHIFT_S:
+        {
+            const uint32_t kind = SHIFT_S_KIND(op.imm);
+            const uint32_t amt  = SHIFT_S_AMT(op.imm);
+
+            int32_t regs[2] = {op.rd, op.rs1};
+            regman.get(2, regs);
+            const psp_gpr_t dst = (psp_gpr_t)regs[0];
+            const psp_gpr_t src = (psp_gpr_t)regs[1];
+
+            if (amt == 0) {
+                if (kind == SHIFT_S_LSL) {
+                    emit_move(dst, src);            // C untouched
+                } else {
+                    // Read the carry bit BEFORE writing dst: dst may alias src.
+                    emit_ext(psp_t0, src, 31, 31);
+                    if (kind == SHIFT_S_LSR) emit_move(dst, psp_zero);
+                    else                     emit_sra(dst, src, 31);
+                    emit_ins(psp_gp, psp_t0, _flag_C8, _flag_C8);
+                }
+            } else {
+                const uint32_t cbit = (kind == SHIFT_S_LSL) ? (32u - amt) : (amt - 1u);
+                emit_ext(psp_t0, src, cbit, cbit);
+                if (kind == SHIFT_S_LSL)      emit_sll(dst, src, amt);
+                else if (kind == SHIFT_S_LSR) emit_srl(dst, src, amt);
+                else                          emit_sra(dst, src, amt);
+                emit_ins(psp_gp, psp_t0, _flag_C8, _flag_C8);
+            }
+
+            emit_srl(psp_t0, dst, 31);
+            emit_ins(psp_gp, psp_t0, _flag_N8, _flag_N8);
+            emit_sltiu(psp_t0, dst, 1);
+            emit_ins(psp_gp, psp_t0, _flag_Z8, _flag_Z8);
+
+            regman.mark_dirty(dst);
+            flag_dirty = true;
+        }
+        break;
+
         case OP_AND:
         {
             int32_t regs[3] = {op.rd, op.rs1, op.rs2};

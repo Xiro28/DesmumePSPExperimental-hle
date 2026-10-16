@@ -17,7 +17,13 @@
 
 // JIT optimization feature flags — comment out to disable an optimization.
 #define JIT_OPT_MULACC       // MLA→madd, UMULL→multu+mflo/mfhi, UMLAL→maddu (64-bit accurate)
-#define JIT_OPT_RRX_GP       // RRX: skip lbu CPSR reload when carry is already in psp_gp
+// RRX carry-from-psp_gp fast path: DISABLED. It skipped the lbu CPSR reload when
+// flag_loaded said the carry was already in psp_gp, but flag_loaded only tracks
+// whether load_flags() ran -- not whether psp_gp still HOLDS the current carry.
+// Difftest showed exactly one failure in every ALU family on the rrx variant
+// (AND/EOR/SUB/RSB/ADD/ADC/SBC/RSC/ORR/TSTS/TEQ/CMPS rrx), and no failure on any
+// other shift form. Saving one lbu is not worth it.
+// #define JIT_OPT_RRX_GP
 #define JIT_OPT_SATURATE     // QADD/QSUB via branchless saturation (was always INTERPRET)
 #define JIT_OPT_SIGNEDMUL16  // SMULxy/SMLAxy via seh/sra+mult/madd (was always INTERPRET)
 #define JIT_OPT_PREDICATE_MUL // MUL/MLA conditional path always via movz/movn (no branch)
@@ -121,6 +127,14 @@ extern uint32_t block_procnum;
         else        { emit_movn(dst, tmp_dst, psp_s4); emit_movz(psp_gp, flag_save, psp_s4); }\
     }
 
+// Guest registers an interpreter-fallback instruction reads and writes, so the
+// register cache can spill just those instead of everything. All-ones means
+// "not classified" -- callers fall back to a full flush. Built by
+// itp_reg_mask() in arm_jit.cpp.
+struct ItpRegMask { uint32_t read, write; };
+ItpRegMask itp_reg_mask(uint32_t opcode);
+extern bool g_itp_selective_flush;
+
 enum op{
     
     // Special custom opcodes
@@ -184,8 +198,24 @@ enum op{
     OP_ADD_S,
     OP_SUB_S,
     OP_MOV_S,
-    OP_MVN_S
+    OP_MVN_S,
+
+    // Thumb LSL/LSR/ASR by an immediate amount, updating N, Z and C (never V) --
+    // the semantics of OP_LSL/OP_LSR/OP_ASR in thumb_instructions.cpp. These were
+    // interpreted; the ITP profiler measured the shift bucket at ~910 fallbacks
+    // per 16384 blocks. op.imm packs the shift: [4:0]=amount, [6:5]=kind
+    // (0=LSL 1=LSR 2=ASR). The amount==0 special cases are folded in by the
+    // decoder, which uses the SHIFT_S_* helpers below.
+    OP_SHIFT_S
 };
+
+// op.imm encoding for OP_SHIFT_S
+#define SHIFT_S_LSL 0u
+#define SHIFT_S_LSR 1u
+#define SHIFT_S_ASR 2u
+#define SHIFT_S_PACK(kind, amt) (int32_t)(((kind) << 5) | ((amt) & 0x1F))
+#define SHIFT_S_KIND(imm)       (((uint32_t)(imm) >> 5) & 3u)
+#define SHIFT_S_AMT(imm)        ((uint32_t)(imm) & 0x1Fu)
 
 enum opType{
     PRE_OP_NONE = -1,

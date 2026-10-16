@@ -133,11 +133,80 @@ const char * save_type_names[] = {
 
 configured_features my_config;
 
+// Per-frame statistics shown by ShowFPS. Filled by the 3D core / JIT so the
+// display code does not have to reach into their internals every frame.
+int g_stat_vtx = 0;
+int g_stat_poly = 0;
+int g_stat_itp_pct = 0;
+
+// Host-side per-frame timings (microseconds), for the stats overlay.
+
+
+// One NDS frame is 355*263 ARM9 cycles. nds.runCycleCollector holds the
+// non-idle cycles of the last 16 frames for each CPU (filled at vblank in
+// NDSSystem.cpp), so averaging it gives a load percentage that does not jump
+// around frame to frame.
+static const s32 kFrameCycles = 1120380;
+
+static int CpuLoadPercent(int cpu)
+{
+  s64 sum = 0;
+  for (int i = 0; i < 16; i++)
+    sum += nds.runCycleCollector[cpu][i];
+  const s64 pct = (sum * 100) / ((s64)kFrameCycles * 16);
+  return (int)(pct < 0 ? 0 : (pct > 999 ? 999 : pct));
+}
 
 void ShowFPS(int x,int y){
-  pspDebugScreenSetXY(x,y);
-  pspDebugScreenPrintf("FPS: %d        ", FPS_Counter);
+  // intraFont is invisible under PPSSPP, so this stays on pspDebugScreen. What
+  // it does have is per-call colour, so use that instead of one flat line:
+  // labels dim, values bright, and the numbers that matter tinted by how good
+  // they are. Colours are 0xAABBGGRR.
+  const u32 C_LABEL = 0xFF909090;   // grey
+  const u32 C_VALUE = 0xFFF0F0F0;   // near-white
+  const u32 C_GOOD  = 0xFF60E060;   // green
+  const u32 C_WARN  = 0xFF40D0F0;   // amber
+  const u32 C_BAD   = 0xFF5050F0;   // red
+
+  const int speed = (FPS_Counter * 100) / 60;
+  const u32 c_fps = (FPS_Counter >= 55) ? C_GOOD
+                  : (FPS_Counter >= 30) ? C_WARN : C_BAD;
+
+  const int a9 = CpuLoadPercent(0);
+  const int a7 = CpuLoadPercent(1);
+  const u32 c_a9 = (a9 >= 90) ? C_BAD : (a9 >= 70) ? C_WARN : C_GOOD;
+  const u32 c_a7 = (a7 >= 90) ? C_BAD : (a7 >= 70) ? C_WARN : C_GOOD;
+
+  extern u32 g_total_ops, g_itp_ops;
+  g_stat_itp_pct = g_total_ops ? (int)((u64)g_itp_ops * 100 / g_total_ops) : 0;
+  const u32 c_itp = (g_stat_itp_pct >= 30) ? C_BAD
+                  : (g_stat_itp_pct >= 10) ? C_WARN : C_GOOD;
+
+  // Row 1: speed.
+  pspDebugScreenSetXY(x, y);
+  pspDebugScreenSetTextColor(C_LABEL); pspDebugScreenPrintf("fps ");
+  pspDebugScreenSetTextColor(c_fps);   pspDebugScreenPrintf("%2d", FPS_Counter);
+  pspDebugScreenSetTextColor(C_LABEL); pspDebugScreenPrintf(" (");
+  pspDebugScreenSetTextColor(c_fps);   pspDebugScreenPrintf("%3d%%", speed);
+  pspDebugScreenSetTextColor(C_LABEL); pspDebugScreenPrintf(")   arm9 ");
+  pspDebugScreenSetTextColor(c_a9);    pspDebugScreenPrintf("%3d%%", a9);
+  pspDebugScreenSetTextColor(C_LABEL); pspDebugScreenPrintf("  arm7 ");
+  pspDebugScreenSetTextColor(c_a7);    pspDebugScreenPrintf("%3d%%", a7);
+  pspDebugScreenSetTextColor(C_LABEL); pspDebugScreenPrintf("    ");
+
+  // Row 2: what the frame cost.
+  pspDebugScreenSetXY(x, y + 1);
+  pspDebugScreenSetTextColor(C_LABEL); pspDebugScreenPrintf("vtx ");
+  pspDebugScreenSetTextColor(C_VALUE); pspDebugScreenPrintf("%5d", g_stat_vtx);
+  pspDebugScreenSetTextColor(C_LABEL); pspDebugScreenPrintf("  poly ");
+  pspDebugScreenSetTextColor(C_VALUE); pspDebugScreenPrintf("%4d", g_stat_poly);
+  pspDebugScreenSetTextColor(C_LABEL); pspDebugScreenPrintf("   itp ");
+  pspDebugScreenSetTextColor(c_itp);   pspDebugScreenPrintf("%3d%%", g_stat_itp_pct);
+  pspDebugScreenSetTextColor(C_LABEL); pspDebugScreenPrintf("    ");
+
+  pspDebugScreenSetTextColor(0xFFFFFFFF);
 }
+
 
 void PrintfXY(const char* text, int x, int y) {
 	pspDebugScreenSetXY(x, y);
@@ -195,6 +264,13 @@ void desmume_cycle()
 		FPS_Counter = fps_frame_counter;
 		fps_frame_counter = 0;
 		last_fps_timing = curr_timing;
+
+		static u32 hot_secs = 0;
+		if (++hot_secs % 10 == 0)
+		{
+			extern void jit_hotblock_report();
+			jit_hotblock_report();
+		}
 	}
 
 	// Frame-rate limiting. Advancing previous_time by exactly one frame period
@@ -223,12 +299,72 @@ void desmume_cycle()
 	// GPU_RenderLine writes into GPU_Screen/GPU_Screen_extra (memalign'd), but
 	// EMU_SCREEN samples VRAM at DISP_POINTER, so copy them across first.
 	{
-		const int sz_SCR = 512 * 192 * 2;
-		sceDmacMemcpy((void*)(0x04100000), (void*)&GPU_Screen[0], sz_SCR);
-		sceDmacMemcpy((void*)(0x04100000 + sz_SCR), (void*)&GPU_Screen_extra[0], sz_SCR);
+		extern bool isEmu;
+		extern void cpuSendInterrupt();
+		extern int meFrameLag();
 
-		renderScreenFull();
-		EMU_SCREEN(false, false);   // draw both; frameskip is applied above
+		// SPU mixing used to live inside renderScreenFull(), so it silently
+		// stopped running as soon as the ME took over the 2D. It has nothing to
+		// do with which CPU renders, so it runs here either way.
+		SPU_Emulate_core();
+
+		if (!isEmu)
+		{
+			// The Media Engine renders the DS 2D and DMAs the result to the GE
+			// itself, so the main CPU only kicks it and draws. Closed loop: ask
+			// how far behind it is rather than guessing, and skip the kick when
+			// it has not caught up -- queueing regardless just makes the lag
+			// grow.
+			#define ME_MAX_LAG 1
+			extern bool drawn;
+			static bool drawingInterruptPending = false;
+
+			// Only touch the display when the ME has actually produced a frame.
+			// Blitting unconditionally cost a full EMU_SCREEN every iteration
+			// even with nothing new to show -- ~17ms per the profile.
+			if (drawn || drawingInterruptPending)
+			{
+				const bool frame_drawn = drawn || drawingInterruptPending;
+
+				// "ITP At Boot" mode: interpret everything until the first frame
+				// reaches the screen, then let the JIT compile. Games that wedge
+				// during early init but run fine afterwards start with this.
+				// Blocks built while interpreting stay interpreted until the code
+				// cache is reset, so the switch is gradual rather than instant.
+				extern int g_jit_booted;
+				if (frame_drawn && !g_jit_booted)
+					g_jit_booted = 1;
+
+				// Queue the next draw only when the ME has the budget. If it is
+				// behind, defer: the interrupt goes out on a later frame once it
+				// catches up. Sending regardless just grows the lag.
+				if (meFrameLag() > ME_MAX_LAG)
+				{
+					drawingInterruptPending = true;
+				}
+				else
+				{
+					cpuSendInterrupt();
+					drawn = false;
+					drawingInterruptPending = false;
+				}
+
+				if (frame_drawn)
+					EMU_SCREEN(false, false);
+			}
+		}
+		else
+		{
+			// No ME: render on this CPU. GPU_RenderLine writes into
+			// GPU_Screen/GPU_Screen_extra (memalign'd), but EMU_SCREEN samples
+			// VRAM at DISP_POINTER, so copy them across first.
+			const int sz_SCR = 512 * 192 * 2;
+			sceDmacMemcpy((void*)(0x04100000), (void*)&GPU_Screen[0], sz_SCR);
+			sceDmacMemcpy((void*)(0x04100000 + sz_SCR), (void*)&GPU_Screen_extra[0], sz_SCR);
+
+			renderScreenFull();
+			EMU_SCREEN(false, false);   // draw both; frameskip is applied above
+		}
 	}
 
 	if (my_config.showfps)
@@ -368,6 +504,12 @@ int main(int argc, char **argv) {
 
 
   Init_PSP_DISPLAY_FRAMEBUFF();
+
+  // Must precede NDS_Init(): Screen_Init() picks the framebuffer location from
+  // isEmu, which only becomes false once the ME is actually up. If kcalli.prx
+  // is missing this leaves isEmu true and everything falls back to the CPU.
+  extern void initMeEngine();
+  initMeEngine();
 
   NDS_Init();
 

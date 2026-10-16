@@ -25,6 +25,23 @@
 #include "emufile.h"
 #include "readwrite.h"
 
+// JITMODE_ITP_DTCM cutover. Games relocate DTCM once, late in boot, after the
+// loader code that the per-instruction codegen bugs trip over. Flipping here
+// switches the JIT out of interpret-everything; the code cache must be dropped
+// because blocks already built are interpreter stubs and would stay that way.
+#include "arm_jit.h"
+extern int g_jit_dtcm_moved;
+// Also reset on any later relocation: blocks bake in "this main-RAM address is
+// not DTCM" (literal folding, constant-address loads/stores).
+static void jit_note_dtcm_write(void)
+{
+    static u32 last_region = 0xFFFFFFFF;
+    if (g_jit_dtcm_moved && MMU.DTCMRegion == last_region) return;
+    g_jit_dtcm_moved = 1;
+    last_region = MMU.DTCMRegion;
+    arm_jit_reset(true, true);
+}
+
 armcp15_t cp15;
 
 #define CP15_ACCESSTYPE(val, n)   (((val) >> (4*n)) & 0x0F)
@@ -439,6 +456,7 @@ BOOL armcp15_t::moveARM2CP_2(u32 val, u8 CRn, u8 CRm, u16 opcodes)
 				{
 				case 0:
 					MMU.DTCMRegion = DTCMRegion = val & 0x0FFFF000;
+					jit_note_dtcm_write();
 					return TRUE;
 				case 1:
 					ITCMRegion = val;
@@ -560,6 +578,7 @@ BOOL armcp15_t::moveARM2CP(u32 val, u8 CRn, u8 CRm, u8 opcode1, u8 opcode2)
 				{
 				case 0:
 					MMU.DTCMRegion = DTCMRegion = val & 0x0FFFF000;
+					jit_note_dtcm_write();
 					return TRUE;
 				case 1:
 					ITCMRegion = val;

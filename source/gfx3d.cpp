@@ -507,6 +507,12 @@ struct tmpVertInfo {
 
 
 static void twiddleLists() {
+	// Snapshot the geometry the frame just built, before the counters are reset
+	// for the next one -- the on-screen stats read these.
+	extern int g_stat_vtx, g_stat_poly;
+	g_stat_vtx  = vertlist->count;
+	g_stat_poly = polylist->count;
+
 	listTwiddle++;
 	listTwiddle &= 1;
 	polylist = &polylists[listTwiddle];

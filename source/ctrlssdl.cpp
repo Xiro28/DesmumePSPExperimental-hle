@@ -248,28 +248,44 @@ process_ctrls_event(u16 &keypad)
 	  if (pad.Buttons & PSP_CTRL_HOME && !select_combo) {
 		Menu();
 	  }	else {
-			if (pad.Buttons & PSP_CTRL_SELECT)
+			u32 buttons = pad.Buttons;
+
+			if (buttons & PSP_CTRL_SELECT)
+			{
 				mouse.click = TRUE;
+
+				// SELECT is doubling as the stylus button, but it is also mapped
+				// to the DS Select key (default_psp_cfg_h[2]). Feeding it to the
+				// pad as well means every touch also presses Select, which fights
+				// with menus that act on it -- Professor Layton's, for one.
+				// The pad registers still get refreshed below; only this one bit
+				// is masked out while it is being used to touch.
+				buttons &= ~PSP_CTRL_SELECT;
+			}
 
 			// The pad registers must keep being refreshed while touching. This
 			// used to be the else-branch of the SELECT test, so holding the
 			// stylus down froze every button -- and, more importantly, stopped
 			// the per-frame EXTKEYIN write the ARM7 polls.
 			u16	nds_pad	= (0 |
-				(((pad.Buttons & default_psp_cfg_h[0]) ? 0 : 0x80) >> 7) |
-				(((pad.Buttons & default_psp_cfg_h[1]) ? 0 : 0x80) >> 6) |
-				(((pad.Buttons & default_psp_cfg_h[2]) ? 0 : 0x80) >> 5) |
-				(((pad.Buttons & default_psp_cfg_h[3]) ? 0 : 0x80) >> 4) |
-				(((pad.Buttons & default_psp_cfg_h[4]) ? 0 : 0x80) >> 3) |
-				(((pad.Buttons & default_psp_cfg_h[5]) ? 0 : 0x80) >> 2) |
-				(((pad.Buttons & default_psp_cfg_h[6]) ? 0 : 0x80) >> 1) |
-				(((pad.Buttons & default_psp_cfg_h[7]) ? 0 : 0x80)     ) |
-				(((pad.Buttons & default_psp_cfg_h[8]) ? 0 : 0x80) << 1) |
-				(((pad.Buttons & default_psp_cfg_h[9]) ? 0 : 0x80) << 2)) ;
+				(((buttons & default_psp_cfg_h[0]) ? 0 : 0x80) >> 7) |
+				(((buttons & default_psp_cfg_h[1]) ? 0 : 0x80) >> 6) |
+				(((buttons & default_psp_cfg_h[2]) ? 0 : 0x80) >> 5) |
+				(((buttons & default_psp_cfg_h[3]) ? 0 : 0x80) >> 4) |
+				(((buttons & default_psp_cfg_h[4]) ? 0 : 0x80) >> 3) |
+				(((buttons & default_psp_cfg_h[5]) ? 0 : 0x80) >> 2) |
+				(((buttons & default_psp_cfg_h[6]) ? 0 : 0x80) >> 1) |
+				(((buttons & default_psp_cfg_h[7]) ? 0 : 0x80)     ) |
+				(((buttons & default_psp_cfg_h[8]) ? 0 : 0x80) << 1) |
+				(((buttons & default_psp_cfg_h[9]) ? 0 : 0x80) << 2)) ;
 
-			u16 padExt = (((pad.Buttons & default_psp_cfg_h[10])? 0 : 0x80) >> 7) |
-				(((pad.Buttons & default_psp_cfg_h[11]) ? 0 : 0x80) >> 6) |
-				(((pad.Buttons & default_psp_cfg_h[12]) ? 0 : 0x80) >> 4) |
+			// [10] = X, [11] = Y. There is no [12]: NB_KEYS is 12, so that read
+			// was off the end of the array -- whatever happened to sit after it
+			// in memory decided bit 3 of padExt, the Guitar Grip button. Games
+			// that probe for that peripheral could see it held down at random.
+			// Inherited from the -hle tree, which has the same line.
+			u16 padExt = (((buttons & default_psp_cfg_h[10])? 0 : 0x80) >> 7) |
+				(((buttons & default_psp_cfg_h[11]) ? 0 : 0x80) >> 6) |
 				((0) << 7) |
 				0x0034;
 						

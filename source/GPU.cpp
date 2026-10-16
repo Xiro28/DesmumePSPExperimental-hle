@@ -1827,17 +1827,26 @@ int Screen_Init()
 
 	disp_fifo.head = disp_fifo.tail = 0;
 
-	// The -hle tree owns isEmu in me_engine.cpp, which is not ported; the
-	// baseline gets the same answer from melib's IsEmu().
-	if (!IsEmu())
+	// The framebuffer lives in the Media Engine's eDRAM when the ME is actually
+	// running -- that is where meHandler() renders and DMAs from. isEmu is owned
+	// by me_engine.cpp and is false ONLY after initMeEngine() succeeded, so this
+	// test is "is the ME live?", not "are we on hardware?".
+	//
+	// Getting that distinction wrong is what crashed a real PSP earlier: the
+	// pointer was set to eDRAM (0x80000000) whenever !IsEmu(), with nothing
+	// having brought the ME up, and the first scanline memset stored into kernel
+	// space -- "Address store, BadVAddr 0x80000200". Screen_Init therefore has
+	// to run AFTER initMeEngine().
+	extern bool isEmu;
+	if (!isEmu)
 	{
 		ME_GPU_Screen = vrp((CACHED_KERNEL_MASK | ME_EDRAM_BASE));
 		displ_pointer = ME_GPU_Screen;
 		GPU_Screen_extra = ME_GPU_Screen + (sizeof(u32) * 192 * 256);
 	}
-	else{
+	else
+	{
 		GPU_Screen = (volatile u8*)memalign(16, sizeof(u32) * 192 * 256);
-        // ALLOCA IL FRONT BUFFER PER IL PC
 		GPU_Screen_extra = (volatile u8*)memalign(16, sizeof(u32) * 192 * 256);
 		displ_pointer = GPU_Screen;
 

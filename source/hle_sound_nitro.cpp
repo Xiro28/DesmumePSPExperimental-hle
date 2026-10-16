@@ -23,6 +23,17 @@
 #include "SPU.h"
 #include "NDSSystem.h"
 
+// Sound HLE tracing. These fired on every sequence start/stop and on each
+// shared-memory write, which is per-frame traffic: the printf cost alone was
+// visible. Set to 1 to get the trace back when debugging the sound path.
+#define SND_TRACE 0
+#if SND_TRACE
+#define SNDPRINT(...) printf(__VA_ARGS__)
+#else
+#define SNDPRINT(...) ((void)0)
+#endif
+
+
 
 
 // MOST OF THE NEW IMPL ARE TAKEN FROM THERE: https://github.com/pret/pokediamond/blob/master/include/nitro/
@@ -463,13 +474,13 @@ void Reset()
     u32 val_7 = _MMU_read32<ARMCPU_ARM7>(a9exe+24);
 
    
-    printf("ARM7: %08X %08X %08X %08X %08X %08X %08X\n", val_1, val_2, val_3, val_4, val_5, val_6, val_7);
+    SNDPRINT("ARM7: %08X %08X %08X %08X %08X %08X %08X\n", val_1, val_2, val_3, val_4, val_5, val_6, val_7);
 
     //E3A0C301 E58CC208 E59F106C E3A0050E E1500001 51A01000 E59F2060
     //E3A0C301 E58CC208 E59F1088 E3A0050E E1500001 51A01000 E59F207C
     //E3A0C301 E58CC208 E59F1088 E3A0050E E1500001 51A01000 E59F207C
 
-    printf("GAME: %s\n", gameInfo.header.gameCode);
+    SNDPRINT("GAME: %s\n", gameInfo.header.gameCode);
 
     if (!memcmp(gameInfo.header.gameCode, "ASM", 3)) // ASMx / Super Mario 64 DS
         Version = 1;
@@ -1105,7 +1116,7 @@ void ProcessCommands()
                 // since it is not known at the start
                 if (offset_cmd == 999){
                     offset_cmd = 0x1D - cmd;
-                    printf("cmd offset %d\n", offset_cmd);
+                    SNDPRINT("cmd offset %d\n", offset_cmd);
                     //printf("cmd %08X %08X %08X %08X %08X %08X\n", cmd, args[0], args[1], args[2], args[3], next);
                 }
                 cmd += offset_cmd;
@@ -1116,7 +1127,7 @@ void ProcessCommands()
             {
             case 0x0: // play sequence, directly
                 {
-                    printf("SND: play seq %d sbnk=%08X\n", args[0], args[3]);
+                    SNDPRINT("SND: play seq %d sbnk=%08X\n", args[0], args[3]);
                     PrepareSequence(args[0], args[1], args[2], args[3]);
                     StartSequence(args[0]);
                 }
@@ -1125,7 +1136,7 @@ void ProcessCommands()
             case 0x1: // stop sequence
                 {
                     u32 id = args[0];
-                    printf("SND: stop seq %d\n", id);
+                    SNDPRINT("SND: stop seq %d\n", id);
                     Sequence* seq = &Sequences[id];
                     if (!(seq->StatusFlags & (1<<0))) break;
 
@@ -1136,14 +1147,14 @@ void ProcessCommands()
                         u32 mask = _MMU_read32<ARMCPU_ARM7>(SharedMem+4);
                         mask &= ~(1<<id);
                         _MMU_write32<ARMCPU_ARM7>(SharedMem+4, mask);
-                        printf("SND: stop seq %d -> mask now=%04X\n", id, mask);
+                        SNDPRINT("SND: stop seq %d -> mask now=%04X\n", id, mask);
                     }
                 }
                 break;
 
             case 0x2: // prepare sequence
                 {
-                    printf("SND: prepare seq %d notedata=%08X noteoff=%08X sbnk=%08X\n",
+                    SNDPRINT("SND: prepare seq %d notedata=%08X noteoff=%08X sbnk=%08X\n",
                         args[0], args[1], args[2], args[3]);
                     PrepareSequence(args[0], args[1], args[2], args[3]);
                 }
@@ -1151,7 +1162,7 @@ void ProcessCommands()
 
             case 0x3: // start sequence
                 {
-                    printf("SND: start seq %d\n", args[0]);
+                    SNDPRINT("SND: start seq %d\n", args[0]);
                     StartSequence(args[0]);
                 }
                 break;
@@ -1161,7 +1172,7 @@ void ProcessCommands()
                 {
                     int seq_id = args[0];
                     bool flag = args[1] & 1;
-                    printf("SND: cmd4 seq %d flag=%d\n", seq_id, flag);
+                    SNDPRINT("SND: cmd4 seq %d flag=%d\n", seq_id, flag);
 
                     Sequence* seq = &Sequences[seq_id];
 
@@ -1201,7 +1212,7 @@ void ProcessCommands()
                     case 0x21C: seq->TickCounter = val & 0xFFFF; break;
 
                     default:
-                        printf("cmd6: unknown write %08X %08X\n", key, val);
+                        SNDPRINT("cmd6: unknown write %08X %08X\n", key, val);
                         break;
                     }
                 }
@@ -1235,7 +1246,7 @@ void ProcessCommands()
                         case 0x20C: track->Frequency = val & 0xFFFF; break;
 
                         default:
-                            printf("cmd7: unknown write %08X %08X\n", key, val);
+                            SNDPRINT("cmd7: unknown write %08X %08X\n", key, val);
                             break;
                         }
                     }
@@ -1262,7 +1273,7 @@ void ProcessCommands()
 
             case 0xA: // write to sharedmem
                 {
-                    printf("Write local sharemem %08X %08X\n", args[0], args[1]);
+                    SNDPRINT("Write local sharemem %08X %08X\n", args[0], args[1]);
                     u32 addr = SharedMem + (args[0] * 0x24) + (args[1] * 2) + 0x20;
                     _MMU_write16<ARMCPU_ARM7>(addr, args[2] & 0xFFFF);
                 }
@@ -1271,7 +1282,7 @@ void ProcessCommands()
             case 0xB: // write to sharedmem
                 {
                     /*if (SharedMem){
-                        printf("Write global sharemem %08X %08X\n", args[0], args[1]);
+                        SNDPRINT("Write global sharemem %08X %08X\n", args[0], args[1]);
                         u32 addr = (u32)&((SNDSharedWork*)SharedMem)->globalVars[args[0] & 0xF];
                         _MMU_write16<ARMCPU_ARM7>(addr, args[1] & 0xFFFF);
                     }*/
@@ -1577,8 +1588,8 @@ void ProcessCommands()
                         //SharedMem = args[0];
                         
                         /*sc_arm7 = 0; // Init it here
-                        printf("%08X\n", SharedMem);
-                        printf("unknown sound cmd %08X, %08X %08X %08X %08X\n",
+                        SNDPRINT("%08X\n", SharedMem);
+                        SNDPRINT("unknown sound cmd %08X, %08X %08X %08X %08X\n",
                         cmd, args[0], args[1], args[2], args[3]);*/
                     }
                 }
@@ -1603,7 +1614,7 @@ void ProcessCommands()
                 u32 chnmask = args[0];
                 u32 flag = args[1];
 
-                printf("stop unlocked channel %08X, %08X %08X %08X %08X\n",
+                SNDPRINT("stop unlocked channel %08X, %08X %08X %08X %08X\n",
                         cmd, chnmask, flag, args[2], args[3]);
 
                 for (int i = 0; i < 16 && chnmask != 0; i++, chnmask >>=1)
@@ -1703,7 +1714,7 @@ void ProcessCommands()
             break;
 
             default:
-                printf("unknown sound cmd %08X, %08X %08X %08X %08X\n",
+                SNDPRINT("unknown sound cmd %08X, %08X %08X %08X %08X\n",
                        cmd, args[0], args[1], args[2], args[3]);
                 break;
             }
@@ -2366,7 +2377,7 @@ int UpdateTrack(Track* track, Sequence* seq, int id, bool process)
                         break;
 
                     default:
-                        printf("Sound_Nitro: unknown note op %02X\n", note_op);
+                        SNDPRINT("Sound_Nitro: unknown note op %02X\n", note_op);
                         break;
                     }
                 }
@@ -2468,7 +2479,7 @@ int UpdateTrack(Track* track, Sequence* seq, int id, bool process)
                         break;
 
                     default:
-                        printf("Sound_Nitro: unknown note op %02X\n", note_op);
+                        SNDPRINT("Sound_Nitro: unknown note op %02X\n", note_op);
                         break;
                     }
                 }
@@ -2493,7 +2504,7 @@ int UpdateTrack(Track* track, Sequence* seq, int id, bool process)
                         break;
 
                     default:
-                        printf("Sound_Nitro: unknown note op %02X\n", note_op);
+                        SNDPRINT("Sound_Nitro: unknown note op %02X\n", note_op);
                         break;
                     }
                 }
@@ -2541,14 +2552,14 @@ int UpdateTrack(Track* track, Sequence* seq, int id, bool process)
                         return -1;
 
                     default:
-                        printf("Sound_Nitro: unknown note op %02X\n", note_op);
+                        SNDPRINT("Sound_Nitro: unknown note op %02X\n", note_op);
                         break;
                     }
                 }
                 break;
 
             default:
-                printf("Sound_Nitro: unknown note op %02X\n", note_op);
+                SNDPRINT("Sound_Nitro: unknown note op %02X\n", note_op);
                 break;
             }
         }
@@ -2593,7 +2604,7 @@ void UpdateSequence(Sequence* seq)
     {
         if (UpdateSequenceTracks(seq, true))
         {
-            printf("SND: seq %d ended naturally\n", seq->ID);
+            SNDPRINT("SND: seq %d ended naturally\n", seq->ID);
             FinishSequence(seq);
             break;
         }
@@ -2636,7 +2647,7 @@ void ProcessSequences(bool update)
         {
             if (--SeqForceFinishCountdown[i] == 0)
             {
-                printf("SND: FORCE finish seq %d\n", i);
+                SNDPRINT("SND: FORCE finish seq %d\n", i);
                 FinishSequence(seq);
                 continue;
             }
@@ -2652,7 +2663,7 @@ void ProcessSequences(bool update)
         _MMU_write32<ARMCPU_ARM7>(SharedMem+4, activemask);
         if (old_mask != (u32)activemask)
         {
-            printf("SND: playerStop mask %04X->%04X\n", old_mask, activemask);
+            SNDPRINT("SND: playerStop mask %04X->%04X\n", old_mask, activemask);
             // DSVita does NOT send reply here either. Just update mask.
         }
     }

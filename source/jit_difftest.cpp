@@ -20,9 +20,29 @@
 #include <cstring>
 #include <cstdarg>
 #include <pspdebug.h>
+#include <unistd.h>   // getcwd, for the ROMS/difftest.txt log
 
 // Report to BOTH the on-screen debug console and stdout (printf -> PSP console /
 // redirected log), so failures can be captured off-device.
+// The full report is far larger than the on-screen log keeps, so mirror every
+// line into ROMS/difftest.txt as well. Opened lazily on the first DTPRINT of a
+// run (dt_log_open() truncates it) and closed by dt_log_close().
+static FILE *g_dtlog = NULL;
+
+static void dt_log_open(void)
+{
+   char path[256];
+   if (getcwd(path, sizeof(path) - 32)) {
+      strcat(path, "/ROMS/difftest.txt");
+      g_dtlog = fopen(path, "w");
+   }
+}
+
+static void dt_log_close(void)
+{
+   if (g_dtlog) { fclose(g_dtlog); g_dtlog = NULL; }
+}
+
 static void DTPRINT(const char *fmt, ...)
 {
    char buf[256];
@@ -32,6 +52,7 @@ static void DTPRINT(const char *fmt, ...)
    va_end(ap);
    pspDebugScreenPrintf("%s", buf);
    printf("%s", buf);
+   if (g_dtlog) { fputs(buf, g_dtlog); fflush(g_dtlog); }
 }
 
 #include "armcpu.h"
@@ -44,6 +65,7 @@ static void DTPRINT(const char *fmt, ...)
 extern block currentBlock;
 extern u32 base_adr;
 extern "C" uint32_t run_block_chain(armcpu_t *armproc, uintptr_t first_block);
+u32 GetFreeSpace();
 template <int PROCNUM> u32 arm_jit_compile();
 void arm_jit_reset(bool enable, bool suppress_msg);
 
@@ -59,6 +81,13 @@ extern s32 s32next;
 // Same address blockdecoder.cpp uses; setting it to 1 makes the chain exit
 // after the first compiled block instead of chasing the trailing "B ." forever.
 #define NDS_ReschedulePtr (*(bool *)(0x0010080))
+
+// Defined in arm_jit.cpp (global linkage -- must be declared OUTSIDE the
+// anonymous namespace below, or it mangles to an internal symbol).
+extern int g_jitCmpPartial;
+extern bool g_last_block_was_native;   // false if the block contained an OP_ITP
+extern u32 g_ldm_wb_count;             // LDM/STM writeback executions
+extern int g_pctrace_on;               // block-PC ring buffer (arm_jit.cpp)
 
 namespace {
 
@@ -90,6 +119,14 @@ void seed_state(armcpu_t &cpu, u32 instr_adr, u32 flag_seed)
    cpu.R[15]            = instr_adr + 8;
    // Randomize NZCV (carry-in matters for ADC/SBC/RSC etc.).
    cpu.CPSR.val = (cpu.CPSR.val & ~0xF0000000u) | (flag_seed & 0xF0000000u);
+   // continue_cpu_dispatch ends the block chain when any of idle_loop / freeze /
+   // freezeBus is set. They carry whatever value the emulator had when the test
+   // was launched, so a stale one made multi-block tests execute only their FIRST
+   // block: the cross-block consumer never ran and every case whose condition was
+   // TRUE reported a bogus register mismatch.
+   cpu.idle_loop  = false;
+   cpu.freeze     = 0;
+   nds.freezeBus  = 0;
 }
 
 void seed_mem()
@@ -148,7 +185,13 @@ bool run_jit(armcpu_t &cpu, u32 op, bool thumb, u32 instr_adr)
    NDS_ReschedulePtr = 1;               // force chain to exit after this one block
    run_block_chain(&cpu, blk);
    NDS_ReschedulePtr = saved_resched;
-   return true;
+
+   // Report whether the op was actually compiled to native code, or fell back to
+   // the interpreter inside the block (OP_ITP). Previously this returned plain
+   // `true` for "a block was produced", which is true even for a pure OP_ITP
+   // block -- so the report printed native=1 for opcodes that the JIT never
+   // touched, and their failures looked like codegen bugs.
+   return g_last_block_was_native;
 }
 
 // ── Multi-op sequence test ───────────────────────────────────────────────────
@@ -171,6 +214,18 @@ void run_interpreter_seq(armcpu_t &cpu, const u32 *ops, int n, u32 base)
 }
 
 // Compile+run the sequence as a single JIT block (terminated by "B .").
+// Compile with the partial-block CMP gate forced ON. arm_jit_compile() runs with
+// full_block=false, where CMP/CMN/TST-immediate are gated on g_jitCmpPartial; with
+// the flag off they fall back to INTERPRET, so the "JIT" side of the diff is the
+// interpreter itself and the test passes while testing nothing.
+static void jit_compile_cmp_on()
+{
+   const int saved_cmp = g_jitCmpPartial;
+   g_jitCmpPartial = 1;
+   arm_jit_compile<0>();
+   g_jitCmpPartial = saved_cmp;
+}
+
 bool run_jit_seq(armcpu_t &cpu, const u32 *ops, int n, u32 base)
 {
    for (int k = 0; k < n; k++)
@@ -184,7 +239,7 @@ bool run_jit_seq(armcpu_t &cpu, const u32 *ops, int n, u32 base)
    cpu.next_instruction = base + 4;
    cpu.R[15]            = base + 8;
 
-   arm_jit_compile<0>();
+   jit_compile_cmp_on();
    uintptr_t blk = JIT_COMPILED_FUNC(base, 0);
    if (!blk) return false;
 
@@ -228,6 +283,9 @@ int begin_family(const char *name)
 struct FailRec { u32 op; const char *fam; };
 constexpr int MAX_FAILS = 64;
 FailRec g_fail_list[MAX_FAILS];
+// Separate from g_nfail_list, which saturates at MAX_FAILS(64): the detail dump
+// needs to keep going past that so late families (CMP reg-shift, TEQ) get lines.
+int g_ndump = 0;
 int     g_nfail_list = 0;
 
 armcpu_t *g_cpu = nullptr;
@@ -260,6 +318,7 @@ bool check_op(u32 op, bool thumb, const char *name)
 
       g_rng = reg_seed; seed_mem();
       seed_state(cpu, g_adr, flag_seed);
+      g_ldm_wb_count = 0;
       bool native = run_jit(cpu, op, thumb, g_adr);
       CpuSnapshot jit; take_snapshot(cpu, jit);
       native_seen = native_seen || native;
@@ -277,8 +336,13 @@ bool check_op(u32 op, bool thumb, const char *name)
             g_fail_list[g_nfail_list++] = { op, name };
          // Detailed dump for the first few distinct failures: show the inputs
          // each operand register actually held, then expected (interp) vs jit.
-         if (g_nfail_list <= 30) {
-            DTPRINT("[FAIL] %s op=%08X native=%d seed=%d\n", name, op, native, seed);
+         // Cap raised from 30: ADCS/SBCS/RSCS alone produce ~60 failures and
+         // consumed the whole budget, so families listed after them (CMP
+         // register-shift, TEQ) reached the summary with no detail lines to
+         // diagnose from.
+         if (++g_ndump <= 200) {
+            DTPRINT("[FAIL] %s op=%08X native=%d seed=%d wb_exec=%u\n",
+                    name, op, native, seed, (unsigned)g_ldm_wb_count);
             // inputs: only the registers this opcode reads, plus flags-in.
             const u32 rn = (op >> 16) & 0xF, rm = op & 0xF,
                       rs = (op >> 8) & 0xF, rd = (op >> 12) & 0xF;
@@ -370,6 +434,14 @@ bool check_seq(const u32 *ops, int n, const char *name)
 // Build an ARM data-processing opcode (immediate or register form).
 inline u32 dp(u32 cond, u32 opc, u32 s, u32 rn, u32 rd, u32 operand2, bool imm)
 {
+   // TST/TEQ/CMP/CMN (opc 8..11) have no destination and exist ONLY with S=1:
+   // that same encoding with S=0 is the MRS/MSR space, a completely different
+   // instruction. The sweep loops s over {0,1} for all 16 opcodes, so the s==0
+   // half was emitting MSR/MRS and comparing it as if it were a compare -- both
+   // interpreter and JIT wrote registers (visible as R2/R3 changing on a "CMP"),
+   // and the mismatch was reported against the CMP families. Force S on.
+   if (opc >= 8 && opc <= 11)
+      s = 1;
    return (cond << 28) | (imm ? (1u << 25) : 0) | (opc << 21) | (s << 20) |
           (rn << 16) | (rd << 12) | (operand2 & 0xFFF);
 }
@@ -395,6 +467,17 @@ void sweep_dataproc()
    for (u32 opc = 0; opc < 16; opc++)
    for (u32 s = 0; s <= 1; s++)
    {
+      // Skip families that are ARM_OP_UNDEF in arm_jit.cpp and therefore always
+      // interpreted in-game: ADC_S(5) SBC_S(6) RSC_S(7) TEQ(9) MOV_S(13) MVN_S(15)
+      // and CMN(11). Their ~70 failures are real codegen bugs but in DEAD code,
+      // and they were crowding the detail dump out for the families that are live.
+      // Flip g_dt_skip_dead to 0 to test them again.
+      static const int g_dt_skip_dead = 1;
+      if (g_dt_skip_dead && s == 1 &&
+          (opc == 5 || opc == 6 || opc == 7 || opc == 13 || opc == 15))
+         continue;
+      if (g_dt_skip_dead && s == 0 && (opc == 9))
+         continue;
       const char *suf = s ? "S" : "";
       char fam[24];
 
@@ -502,7 +585,8 @@ bool check_branch(u32 op, const char *name)
       if (i_next != j_next || i_r14 != j_r14 || i_cpsr != j_cpsr)
       {
          fam.failed++;
-         DTPRINT("[FAIL] %s op=%08X native=%d seed=%d\n", name, op, native, seed);
+         DTPRINT("[FAIL] %s op=%08X native=%d seed=%d wb_exec=%u\n",
+                    name, op, native, seed, (unsigned)g_ldm_wb_count);
          DTPRINT("   next exp=%08X jit=%08X  R15 exp=%08X jit=%08X\n", i_next, j_next, i_r15, j_r15);
          DTPRINT("   R14  exp=%08X jit=%08X  cpsr exp=%08X jit=%08X\n", i_r14, j_r14, i_cpsr, j_cpsr);
          if (native_seen) fam.native++;
@@ -557,7 +641,7 @@ void check_branch_chain(u32 branch_op, const char *name)
    for (int k = 0; k < 8 && cpu.R[5] != 0x42; k++)
    {
       uintptr_t b = JIT_COMPILED_FUNC(cpu.instruct_adr, 0);
-      if (!b) { arm_jit_compile<0>(); b = JIT_COMPILED_FUNC(cpu.instruct_adr, 0); }
+      if (!b) { jit_compile_cmp_on(); b = JIT_COMPILED_FUNC(cpu.instruct_adr, 0); }
       if (!b) { DTPRINT("[CHAIN] %s: instr_adr=%08X not compiled\n", name, cpu.instruct_adr); break; }
       run_block_chain(&cpu, b);
    }
@@ -605,7 +689,7 @@ void check_cond_chain(u32 branch_op, const char *name, u32 taken_flags, u32 nott
       for (int k = 0; k < 8 && cpu.R[5] != 0x42 && cpu.R[6] != 0x99; k++)
       {
          uintptr_t b = JIT_COMPILED_FUNC(cpu.instruct_adr, 0);
-         if (!b) { arm_jit_compile<0>(); b = JIT_COMPILED_FUNC(cpu.instruct_adr, 0); }
+         if (!b) { jit_compile_cmp_on(); b = JIT_COMPILED_FUNC(cpu.instruct_adr, 0); }
          if (!b) break;
          run_block_chain(&cpu, b);
       }
@@ -659,7 +743,7 @@ void check_fallthrough_chain(const char *name)
    for (int k = 0; k < 8 && cpu.R[5] != 0x42; k++)
    {
       uintptr_t b = JIT_COMPILED_FUNC(cpu.instruct_adr, 0);
-      if (!b) { arm_jit_compile<0>(); b = JIT_COMPILED_FUNC(cpu.instruct_adr, 0); }
+      if (!b) { jit_compile_cmp_on(); b = JIT_COMPILED_FUNC(cpu.instruct_adr, 0); }
       if (!b) { DTPRINT("[FALLT] %s: instr_adr=%08X not compiled\n", name, cpu.instruct_adr); break; }
       run_block_chain(&cpu, b);
    }
@@ -832,11 +916,17 @@ void check_xblock(u32 setter, u32 consumer, const char *name)
       NDS_ReschedulePtr = 0;
       int trace_n = 0; u32 trace_pc[8] = {0};
       for (int k = 0; k < 6; k++) {
+         // Re-clear per hop: a compiled block can set idle_loop itself, and the
+         // dispatcher would then refuse to chain into the next block.
+         cpu.idle_loop = false; cpu.freeze = 0; nds.freezeBus = 0;
          if (trace_n < 8) trace_pc[trace_n++] = cpu.instruct_adr;
          uintptr_t b = JIT_COMPILED_FUNC(cpu.instruct_adr, 0);
-         if (!b) { arm_jit_compile<0>(); b = JIT_COMPILED_FUNC(cpu.instruct_adr, 0); }
+         if (!b) { jit_compile_cmp_on(); b = JIT_COMPILED_FUNC(cpu.instruct_adr, 0); }
          if (!b) break;
-         run_block_chain(&cpu, b);
+         const u32 rbc = run_block_chain(&cpu, b);
+         if (trace_n <= 8)
+            DTPRINT("   [hop%d] blk=%08X -> pc=%08X rbc=%u free=%u\n",
+                    k, (u32)b, cpu.instruct_adr, rbc, (unsigned)GetFreeSpace());
          if (cpu.instruct_adr == a + 16) break;
       }
       NDS_ReschedulePtr = saved;
@@ -850,6 +940,10 @@ void check_xblock(u32 setter, u32 consumer, const char *name)
          fam.failed++;
          DTPRINT("[XBLK] %s seed=%d set=%08X cons=%08X\n", name, seed, setter, consumer);
          DTPRINT("   base=%08X final_pc=%08X steps=%d\n", a, cpu.instruct_adr, trace_n);
+         DTPRINT("   blk_a=%08X blk_a12=%08X resched=%d idle=%d frz=%d fbus=%d\n",
+                 (u32)JIT_COMPILED_FUNC(a, 0), (u32)JIT_COMPILED_FUNC(a + 12, 0),
+                 (int)NDS_ReschedulePtr, (int)cpu.idle_loop, (int)cpu.freeze,
+                 (int)nds.freezeBus);
          for (int t = 0; t < trace_n; t++) DTPRINT("   step%d pc=%08X\n", t, trace_pc[t]);
          DTPRINT("   flg in=%08X expect=%08X jit=%08X\n",
                  in.cpsr_flags, itp.cpsr_flags, jit.cpsr_flags);
@@ -913,16 +1007,28 @@ extern "C" void jit_difftest_run_force()
 
    g_cpu = &cpu;
    g_adr = SCRATCH_BASE + 0x200;
-   g_nfams = 0; g_nfail_list = 0; g_cur_fam = -1;
+   g_nfams = 0; g_nfail_list = 0; g_ndump = 0; g_cur_fam = -1;
+   dt_log_open();
+   // The difftest compiles thousands of one-instruction blocks at a single
+   // address, which floods the PC ring buffer and hides the game's trace.
+   // Turn recording off for the duration of the suite.
+   const int saved_pctrace = g_pctrace_on;
+   g_pctrace_on = 0;
 
-   sweep_cmp_sequences();   // multi-op within ONE block
-   sweep_cmp_xblock();      // flags across a BLOCK BOUNDARY (the in-game pattern)
-   sweep_ldrstr();
-   sweep_branch();
+   DTPRINT("=== DIFFTEST BUILD MARKER 1924 ===\n");
+   // ORDER MATTERS: the per-case [FAIL] dump is capped at 30 entries
+   // (g_nfail_list <= 30), and sweep_ldrstr alone produces 48 failures. Running
+   // it first consumed the whole budget, so the rrx / carry-consumer failures
+   // were reported in the summary with NO detail lines to diagnose them from.
+   // Put the data-processing sweeps first while those are the ones under study.
    sweep_dataproc();
    sweep_dataproc_cond();
-   sweep_ldmstm();
+   sweep_cmp_sequences();   // multi-op within ONE block
+   sweep_cmp_xblock();      // flags across a BLOCK BOUNDARY (the in-game pattern)
+   sweep_branch();
    sweep_mul();
+   sweep_ldmstm();
+   sweep_ldrstr();
 
    cpu = saved;
 
@@ -950,4 +1056,8 @@ extern "C" void jit_difftest_run_force()
    } else {
       DTPRINT("ALL PASS\n");
    }
+
+   DTPRINT("(report also written to ROMS/difftest.txt)\n");
+   g_pctrace_on = saved_pctrace;
+   dt_log_close();
 }

@@ -75,3 +75,11 @@ static const bool arm7_core_active = true;
 extern u32 HLE_SERVICE_MASK;
 bool HLE_handles(u32 service);
 
+// Runtime HLE mode: 0 Sound Only, 1 Full HLE, 2 Core Only. Changing it rewrites
+// HLE_SERVICE_MASK and takes effect on the next IPC message -- safe mid-game.
+extern int g_hle_mode;
+
+// Non-zero only in mode 3: exec_cpu stops stepping the real ARM7 core.
+extern int g_arm7_core_parked;
+void HLE_ApplyMode(int mode);
+

@@ -76,6 +76,7 @@ extern u8 jit_opt_constprop;   // constant propagation pass (ARM)
 extern u8 jit_opt_condmerge;   // condition-merge pass (ARM)
 extern u8 jit_opt_thumbflags;  // Thumb dead-flag elimination pass
 extern u8 jit_opt_fastmem;     // inline main-RAM fast path for word LDR (ARM9)
+extern u8 jit_opt_litfold;     // compile PC-relative literal loads as constants
 
 static inline void JIT_MarkCodePage(u32 adr)
 {

@@ -23,6 +23,7 @@
 #include <stdint.h>
 #include <vector>
 #include <unordered_map>
+#include <algorithm>
 
 #include "MMU.h"
 #include "MMU_timing.h"
@@ -46,6 +47,70 @@ uint32_t interpreted_cycles = 0;
 uint32_t base_adr = 0;
 
 bool full_block = false;
+
+// Diagnostic: dump the first CMP-containing block in both partial and full_block
+// form, then clear itself. Set to 0 to disable.
+// CMPDUMP: done -- the partial/full comparison it was built for came out
+// byte-identical, and it emits the block three times, which confuses any other
+// per-block diagnostic (it consumed the LDM code-dump counter on its own pass).
+extern "C" uintptr_t jit_lookup_dbg(u32 adr)
+{
+   return (uintptr_t)JIT_COMPILED_FUNC(adr, 0);
+}
+
+// Per-CPU JIT mode, settable from the menu (JIT EXPERIMENTAL tab).
+//
+//   JITMODE_FULL     everything compiled  (default, fastest)
+//   JITMODE_HALF     ARM compiled, Thumb interpreted
+//   JITMODE_ITP_BOOT interpret until the first frame is drawn, then compile
+//   JITMODE_ITP      blocks are still built/looked up/chained, but every
+//                    instruction falls back to the interpreter
+//
+// Bisection with these modes established that block lookup, invalidation,
+// chaining and the scheduler are all sound: JITMODE_ITP boots fine. What is left
+// is per-instruction codegen -- separately broken in the Thumb path (wedges the
+// boot) and in the ARM path (crashes later).
+enum {
+   JITMODE_FULL = 0,
+   JITMODE_HALF = 1,
+   JITMODE_ITP_BOOT = 2,
+   JITMODE_ITP = 3,
+   // Interpret everything until the ARM9 relocates DTCM (CP15 c9,c1,0). Games
+   // do that once, late in the boot sequence, after the BIOS/loader work that
+   // the per-instruction codegen bugs trip over -- so it is a later and more
+   // precise cutover point than ITP_BOOT's "first frame drawn".
+   JITMODE_ITP_DTCM = 4,
+};
+int g_jit_mode[2] = { JITMODE_FULL, JITMODE_FULL };   // [0]=ARM9 [1]=ARM7
+int g_jit_booted  = 0;   // set once the first frame is drawn (for ITP_BOOT)
+// Set by cp15.cpp the first time the ARM9 writes the DTCM base register
+// (CP15 c9,c1,0). Drives JITMODE_ITP_DTCM.
+int g_jit_dtcm_moved = 0;
+
+// Interpreter-fallback ratio for the on-screen stats: how many of the decoded
+// instructions could not be compiled. Sampled (not reset) so it reads as a
+// running figure for the code compiled so far.
+u32 g_total_ops = 0;
+u32 g_itp_ops   = 0;
+
+// True when this CPU should interpret ARM ops right now.
+static inline bool jit_itp_arm(int procnum)
+{
+   const int m = g_jit_mode[procnum];
+   return m == JITMODE_ITP ||
+          (m == JITMODE_ITP_BOOT && !g_jit_booted) ||
+          (m == JITMODE_ITP_DTCM && !g_jit_dtcm_moved);
+}
+// True when this CPU should interpret Thumb ops right now.
+static inline bool jit_itp_thumb(int procnum)
+{
+   const int m = g_jit_mode[procnum];
+   return m == JITMODE_ITP || m == JITMODE_HALF ||
+          (m == JITMODE_ITP_BOOT && !g_jit_booted) ||
+          (m == JITMODE_ITP_DTCM && !g_jit_dtcm_moved);
+}
+
+int g_dumpCmpBlock = 0;
 
 CACHE_ALIGN JIT_struct JIT;
 
@@ -402,6 +467,94 @@ static u32 instr_attributes(u32 opcode)
                 : instruction_attributes[INSTRUCTION_INDEX(opcode)];
 }
 
+// ---- Interpreter-fallback register masks -------------------------------------
+//
+// For an instruction that falls back to the interpreter (OP_ITP), work out which
+// guest registers it reads and which it writes, so the register cache only has
+// to spill what is actually involved instead of everything (see
+// register_manager::flush_selective).
+//
+// Reads come straight from the SRCREG_* bits the attribute table already carries
+// for every opcode. Writes are not tabulated, so they are derived from the
+// encoding -- and deliberately over-approximated: a register wrongly listed as
+// written only costs a reload, while one wrongly omitted would leave a stale
+// value in the cache. Anything not confidently classified returns all-ones,
+// which reproduces the old flush-everything behaviour.
+bool g_itp_selective_flush = true;   // 0 restores the old flush-everything path
+
+ItpRegMask itp_reg_mask(u32 opcode)
+{
+   const ItpRegMask conservative = { 0xFFFFu, 0xFFFFu };
+
+   if (thumb)
+      return conservative;      // Thumb: not classified yet, keep the old path
+
+   const u32 x = instr_attributes(opcode);
+
+   // JIT_BYPASS means "the JIT makes no assumptions about this instruction".
+   if (x & JIT_BYPASS)
+      return conservative;
+
+   ItpRegMask m = { 0, 0 };
+
+   if (x & SRCREG_POS0)  m.read |= 1u << REG_POS(opcode, 0);
+   if (x & SRCREG_POS8)  m.read |= 1u << REG_POS(opcode, 8);
+   if (x & SRCREG_POS12) m.read |= 1u << REG_POS(opcode, 12);
+   if (x & SRCREG_POS16) m.read |= 1u << REG_POS(opcode, 16);
+   if (x & SRCREG_STM)   m.read |= opcode & 0xFFFF;   // the register list
+
+   const u32 cls = (opcode >> 26) & 3;
+   switch (cls)
+   {
+   case 0:   // data processing (and the multiply / halfword-transfer space)
+   {
+      // Multiplies and the LDRH/STRH/LDRD space live in the same class and are
+      // encoded differently; leave those to the conservative path.
+      const bool mul_or_halfword = ((opcode & 0x0FC000F0) == 0x00000090) ||
+                                   ((opcode & 0x0E000090) == 0x00000090);
+      if (mul_or_halfword)
+         return conservative;
+
+      const u32 opc = (opcode >> 21) & 0xF;
+      const bool is_compare = (opc >= 8 && opc <= 11);   // TST TEQ CMP CMN
+      if (!is_compare)
+         m.write |= 1u << REG_POS(opcode, 12);           // Rd
+      break;
+   }
+   case 1:   // load / store single
+   {
+      const bool load = (opcode >> 20) & 1;
+      const bool wb   = (((opcode >> 24) & 1) == 0) || (((opcode >> 21) & 1) != 0);
+      if (load)
+         m.write |= 1u << REG_POS(opcode, 12);           // Rt
+      else
+         m.read  |= 1u << REG_POS(opcode, 12);           // stored value
+      m.read |= 1u << REG_POS(opcode, 16);               // base
+      if (wb)
+         m.write |= 1u << REG_POS(opcode, 16);           // base writeback
+      break;
+   }
+   default:
+      // Block transfer, branches, coprocessor, SWI: PC/mode effects and lists
+      // that are not worth classifying here.
+      return conservative;
+   }
+
+   // R15 in either mask means the instruction can change the PC; the block has
+   // to stop there anyway, so do not try to be clever about it.
+   if (((m.read | m.write) & (1u << 15)) != 0)
+      return conservative;
+
+   // An interpreter handler that sets flags also writes CPSR, and any handler
+   // may touch state beyond its named operands. The write mask is what decides
+   // which registers keep their host copy, so it has to be an OVER-estimate:
+   // add the S-bit destination even where the encoding does not name one.
+   if ((opcode >> 20) & 1)                 // S set: flags change too
+      m.write |= 1u << REG_POS(opcode, 12);
+
+   return m;
+}
+
 static bool instr_is_conditional(u32 opcode)
 {
    if (thumb)
@@ -450,15 +603,22 @@ typedef INSTR_R (*DynaCompiler)(uint32_t pc, uint32_t opcode);
 #define ARM_OP_REG_(name, PREOP, _rd, cond)                                                                                                                 \
    static INSTR_R ARM_OP_##name##_##PREOP(uint32_t pc, const u32 i)                                                                                         \
    {                                                                                                                                                        \
+      if (!JIT_ENABLE_ALU_SHIFT) return INTERPRET;                                                                                                   \
       if (instr_is_conditional(i) && !cond)                                                                                                                 \
          return INTERPRET;                                                                                                                                  \
       currentBlock.addOP(OP_##name, i, pc, _rd, REG_POS(i, 16), REG_POS(i, 0), REG_POS(i, 8), PRE_OP_##PREOP, instr_is_conditional(i) ? CONDITION(i) : -1); \
       return DYNAREC;                                                                                                                                       \
    }
 
+// BISECT: 0 sends the shifted-operand ALU forms (ARM_OP_IMM_/ARM_OP_REG_) to the
+// interpreter. Ruled out so far: LDM/STM (verified), LDR/STR, the Thumb shifts /
+// op.imm / STM-LR group, instr_cycles, the SRA pool. ARM9 JIT off DOES boot.
+#define JIT_ENABLE_ALU_SHIFT 1
+
 #define ARM_OP_IMM_(name, PREOP, _rd, cond)                                                                                                                     \
    static INSTR_R ARM_OP_##name##_##PREOP(uint32_t pc, const u32 i)                                                                                             \
    {                                                                                                                                                            \
+      if (!JIT_ENABLE_ALU_SHIFT) return INTERPRET;                                                                                                   \
       if (instr_is_conditional(i) && !cond)                                                                                                                     \
          return INTERPRET;                                                                                                                                      \
       currentBlock.addOP(OP_##name, i, pc, _rd, REG_POS(i, 16), REG_POS(i, 0), ((i >> 7) & 0x1F), PRE_OP_##PREOP, instr_is_conditional(i) ? CONDITION(i) : -1); \
@@ -754,14 +914,28 @@ static INSTR_R ARM_OP_CMN_IMM_VAL(uint32_t pc, const u32 i)
 // ISOLATION: S-ops off, CMP-imm on. CMP alone booted before; if it boots now the
 // S-ops are the remaining problem, if not it's CMP or one of the two structural
 // fixes (condition-merge guard / V-flag emit_ins).
-#define JIT_AND_S 0
-#define JIT_EOR_S 0
-#define JIT_SUB_S 0
-#define JIT_ADD_S 0
-#define JIT_ORR_S 0
+// Split per form. The rotated-immediate variant (_IMM_VAL) is difftest-clean
+// (ANDS/EORS/SUBS/ADDS/ORRS "imm" all report 12 tested / 0 failed) and is the
+// form that actually costs interpreter fallback in-game (~5k/frame in Pokemon).
+// The register/immediate-SHIFT forms share a barrel-shifter carry bug: with
+// ROR #0 (RRX) the carry is taken from bit 31 (N) instead of bit 29 (C) --
+// verified numerically, reading N reproduces the JIT's exact wrong result. Those
+// stay interpreted until that is fixed.
+#define JIT_AND_S_IMM 1
+#define JIT_EOR_S_IMM 1
+#define JIT_SUB_S_IMM 1
+#define JIT_ADD_S_IMM 1
+#define JIT_ORR_S_IMM 1
+
+#define JIT_AND_S_SHIFT 0
+#define JIT_EOR_S_SHIFT 0
+#define JIT_SUB_S_SHIFT 0
+#define JIT_ADD_S_SHIFT 0
+#define JIT_ORR_S_SHIFT 0
 
 // AND_S / ANDS
-#if JIT_AND_S
+// AND_S: shift forms (see the JIT_*_S_SHIFT note above)
+#if JIT_AND_S_SHIFT
 ARM_OP_IMM(AND_S, LSL_IMM)
 ARM_OP_REG(AND_S, LSL_REG)
 ARM_OP_IMM(AND_S, LSR_IMM)
@@ -770,6 +944,19 @@ ARM_OP_IMM(AND_S, ASR_IMM)
 ARM_OP_REG(AND_S, ASR_REG)
 ARM_OP_IMM(AND_S, ROR_IMM)
 ARM_OP_REG(AND_S, ROR_REG)
+#else
+disable_op(AND_S, LSL_IMM)
+disable_op(AND_S, LSL_REG)
+disable_op(AND_S, LSR_IMM)
+disable_op(AND_S, LSR_REG)
+disable_op(AND_S, ASR_IMM)
+disable_op(AND_S, ASR_REG)
+disable_op(AND_S, ROR_IMM)
+disable_op(AND_S, ROR_REG)
+#endif
+
+// AND_S: rotated-immediate form
+#if JIT_AND_S_IMM
 static INSTR_R ARM_OP_AND_S_IMM_VAL(uint32_t pc, const u32 i)
 {
    // rd==15: SUBS/MOVS pc,... restores CPSR from SPSR and branches (return-from-IRQ);
@@ -781,19 +968,12 @@ static INSTR_R ARM_OP_AND_S_IMM_VAL(uint32_t pc, const u32 i)
    return DYNAREC;
 }
 #else
-disable_op(AND_S, LSL_IMM)
-disable_op(AND_S, LSL_REG)
-disable_op(AND_S, LSR_IMM)
-disable_op(AND_S, LSR_REG)
-disable_op(AND_S, ASR_IMM)
-disable_op(AND_S, ASR_REG)
-disable_op(AND_S, ROR_IMM)
-disable_op(AND_S, ROR_REG)
 static INSTR_R ARM_OP_AND_S_IMM_VAL(uint32_t pc, const u32 i) { return INTERPRET; }
 #endif
 
 // EOR_S / EORS
-#if JIT_EOR_S
+// EOR_S: shift forms (see the JIT_*_S_SHIFT note above)
+#if JIT_EOR_S_SHIFT
 ARM_OP_IMM(EOR_S, LSL_IMM)
 ARM_OP_REG(EOR_S, LSL_REG)
 ARM_OP_IMM(EOR_S, LSR_IMM)
@@ -802,12 +982,6 @@ ARM_OP_IMM(EOR_S, ASR_IMM)
 ARM_OP_REG(EOR_S, ASR_REG)
 ARM_OP_IMM(EOR_S, ROR_IMM)
 ARM_OP_REG(EOR_S, ROR_REG)
-static INSTR_R ARM_OP_EOR_S_IMM_VAL(uint32_t pc, const u32 i)
-{
-   if (REG_POS(i, 12) == 15) return INTERPRET;   // rd=pc → CPSR restore + branch
-   currentBlock.addOP(OP_EOR_S, i, pc, REG_POS(i,12), REG_POS(i,16), -1, ROR((i&0xFF),(i>>7)&0x1E), PRE_OP_IMM, instr_is_conditional(i)?CONDITION(i):-1, EXTFL_NONE);
-   return DYNAREC;
-}
 #else
 disable_op(EOR_S, LSL_IMM)
 disable_op(EOR_S, LSL_REG)
@@ -817,25 +991,31 @@ disable_op(EOR_S, ASR_IMM)
 disable_op(EOR_S, ASR_REG)
 disable_op(EOR_S, ROR_IMM)
 disable_op(EOR_S, ROR_REG)
+#endif
+
+// EOR_S: rotated-immediate form
+#if JIT_EOR_S_IMM
+static INSTR_R ARM_OP_EOR_S_IMM_VAL(uint32_t pc, const u32 i)
+{
+   if (REG_POS(i, 12) == 15) return INTERPRET;   // rd=pc → CPSR restore + branch
+   currentBlock.addOP(OP_EOR_S, i, pc, REG_POS(i,12), REG_POS(i,16), -1, ROR((i&0xFF),(i>>7)&0x1E), PRE_OP_IMM, instr_is_conditional(i)?CONDITION(i):-1, EXTFL_NONE);
+   return DYNAREC;
+}
+#else
 static INSTR_R ARM_OP_EOR_S_IMM_VAL(uint32_t pc, const u32 i) { return INTERPRET; }
 #endif
 
 // SUB_S / SUBS
-#if JIT_SUB_S
-ARM_OP_S_IMM(SUB_S, LSL_IMM)
-ARM_OP_S_REG(SUB_S, LSL_REG)
-ARM_OP_S_IMM(SUB_S, LSR_IMM)
-ARM_OP_S_REG(SUB_S, LSR_REG)
-ARM_OP_S_IMM(SUB_S, ASR_IMM)
-ARM_OP_S_REG(SUB_S, ASR_REG)
-ARM_OP_S_IMM(SUB_S, ROR_IMM)
-ARM_OP_S_REG(SUB_S, ROR_REG)
-static INSTR_R ARM_OP_SUB_S_IMM_VAL(uint32_t pc, const u32 i)
-{
-   if (REG_POS(i, 12) == 15) return INTERPRET;
-   currentBlock.addOP(OP_SUB_S, i, pc, REG_POS(i,12), REG_POS(i,16), -1, ROR((i&0xFF),(i>>7)&0x1E), PRE_OP_IMM, instr_is_conditional(i)?CONDITION(i):-1, EXTFL_NONE);
-   return DYNAREC;
-}
+// SUB_S: shift forms (see the JIT_*_S_SHIFT note above)
+#if JIT_SUB_S_SHIFT
+ARM_OP_IMM(SUB_S, LSL_IMM)
+ARM_OP_REG(SUB_S, LSL_REG)
+ARM_OP_IMM(SUB_S, LSR_IMM)
+ARM_OP_REG(SUB_S, LSR_REG)
+ARM_OP_IMM(SUB_S, ASR_IMM)
+ARM_OP_REG(SUB_S, ASR_REG)
+ARM_OP_IMM(SUB_S, ROR_IMM)
+ARM_OP_REG(SUB_S, ROR_REG)
 #else
 disable_op(SUB_S, LSL_IMM)
 disable_op(SUB_S, LSL_REG)
@@ -845,25 +1025,31 @@ disable_op(SUB_S, ASR_IMM)
 disable_op(SUB_S, ASR_REG)
 disable_op(SUB_S, ROR_IMM)
 disable_op(SUB_S, ROR_REG)
+#endif
+
+// SUB_S: rotated-immediate form
+#if JIT_SUB_S_IMM
+static INSTR_R ARM_OP_SUB_S_IMM_VAL(uint32_t pc, const u32 i)
+{
+   if (REG_POS(i, 12) == 15) return INTERPRET;
+   currentBlock.addOP(OP_SUB_S, i, pc, REG_POS(i,12), REG_POS(i,16), -1, ROR((i&0xFF),(i>>7)&0x1E), PRE_OP_IMM, instr_is_conditional(i)?CONDITION(i):-1, EXTFL_NONE);
+   return DYNAREC;
+}
+#else
 static INSTR_R ARM_OP_SUB_S_IMM_VAL(uint32_t pc, const u32 i) { return INTERPRET; }
 #endif
 
 // ADD_S / ADDS
-#if JIT_ADD_S
-ARM_OP_S_IMM(ADD_S, LSL_IMM)
-ARM_OP_S_REG(ADD_S, LSL_REG)
-ARM_OP_S_IMM(ADD_S, LSR_IMM)
-ARM_OP_S_REG(ADD_S, LSR_REG)
-ARM_OP_S_IMM(ADD_S, ASR_IMM)
-ARM_OP_S_REG(ADD_S, ASR_REG)
-ARM_OP_S_IMM(ADD_S, ROR_IMM)
-ARM_OP_S_REG(ADD_S, ROR_REG)
-static INSTR_R ARM_OP_ADD_S_IMM_VAL(uint32_t pc, const u32 i)
-{
-   if (REG_POS(i, 12) == 15) return INTERPRET;
-   currentBlock.addOP(OP_ADD_S, i, pc, REG_POS(i,12), REG_POS(i,16), -1, ROR((i&0xFF),(i>>7)&0x1E), PRE_OP_IMM, instr_is_conditional(i)?CONDITION(i):-1, EXTFL_NONE);
-   return DYNAREC;
-}
+// ADD_S: shift forms (see the JIT_*_S_SHIFT note above)
+#if JIT_ADD_S_SHIFT
+ARM_OP_IMM(ADD_S, LSL_IMM)
+ARM_OP_REG(ADD_S, LSL_REG)
+ARM_OP_IMM(ADD_S, LSR_IMM)
+ARM_OP_REG(ADD_S, LSR_REG)
+ARM_OP_IMM(ADD_S, ASR_IMM)
+ARM_OP_REG(ADD_S, ASR_REG)
+ARM_OP_IMM(ADD_S, ROR_IMM)
+ARM_OP_REG(ADD_S, ROR_REG)
 #else
 disable_op(ADD_S, LSL_IMM)
 disable_op(ADD_S, LSL_REG)
@@ -873,11 +1059,23 @@ disable_op(ADD_S, ASR_IMM)
 disable_op(ADD_S, ASR_REG)
 disable_op(ADD_S, ROR_IMM)
 disable_op(ADD_S, ROR_REG)
+#endif
+
+// ADD_S: rotated-immediate form
+#if JIT_ADD_S_IMM
+static INSTR_R ARM_OP_ADD_S_IMM_VAL(uint32_t pc, const u32 i)
+{
+   if (REG_POS(i, 12) == 15) return INTERPRET;
+   currentBlock.addOP(OP_ADD_S, i, pc, REG_POS(i,12), REG_POS(i,16), -1, ROR((i&0xFF),(i>>7)&0x1E), PRE_OP_IMM, instr_is_conditional(i)?CONDITION(i):-1, EXTFL_NONE);
+   return DYNAREC;
+}
+#else
 static INSTR_R ARM_OP_ADD_S_IMM_VAL(uint32_t pc, const u32 i) { return INTERPRET; }
 #endif
 
 // ORR_S / ORRS
-#if JIT_ORR_S
+// ORR_S: shift forms (see the JIT_*_S_SHIFT note above)
+#if JIT_ORR_S_SHIFT
 ARM_OP_IMM(ORR_S, LSL_IMM)
 ARM_OP_REG(ORR_S, LSL_REG)
 ARM_OP_IMM(ORR_S, LSR_IMM)
@@ -886,12 +1084,6 @@ ARM_OP_IMM(ORR_S, ASR_IMM)
 ARM_OP_REG(ORR_S, ASR_REG)
 ARM_OP_IMM(ORR_S, ROR_IMM)
 ARM_OP_REG(ORR_S, ROR_REG)
-static INSTR_R ARM_OP_ORR_S_IMM_VAL(uint32_t pc, const u32 i)
-{
-   if (REG_POS(i, 12) == 15) return INTERPRET;   // rd=pc → CPSR restore + branch
-   currentBlock.addOP(OP_ORR_S, i, pc, REG_POS(i,12), REG_POS(i,16), -1, ROR((i&0xFF),(i>>7)&0x1E), PRE_OP_IMM, instr_is_conditional(i)?CONDITION(i):-1, EXTFL_NONE);
-   return DYNAREC;
-}
 #else
 disable_op(ORR_S, LSL_IMM)
 disable_op(ORR_S, LSL_REG)
@@ -901,6 +1093,17 @@ disable_op(ORR_S, ASR_IMM)
 disable_op(ORR_S, ASR_REG)
 disable_op(ORR_S, ROR_IMM)
 disable_op(ORR_S, ROR_REG)
+#endif
+
+// ORR_S: rotated-immediate form
+#if JIT_ORR_S_IMM
+static INSTR_R ARM_OP_ORR_S_IMM_VAL(uint32_t pc, const u32 i)
+{
+   if (REG_POS(i, 12) == 15) return INTERPRET;   // rd=pc → CPSR restore + branch
+   currentBlock.addOP(OP_ORR_S, i, pc, REG_POS(i,12), REG_POS(i,16), -1, ROR((i&0xFF),(i>>7)&0x1E), PRE_OP_IMM, instr_is_conditional(i)?CONDITION(i):-1, EXTFL_NONE);
+   return DYNAREC;
+}
+#else
 static INSTR_R ARM_OP_ORR_S_IMM_VAL(uint32_t pc, const u32 i) { return INTERPRET; }
 #endif
 
@@ -1087,6 +1290,11 @@ ARM_MEM_OP_DEF(LDRB);
 #define GEN_ARM_STR_OP_FUNC(Name, MODE, VAL)                                                                                                                \
    static INSTR_R Name(uint32_t pc, const u32 i)                                                                                                            \
    {                                                                                                                                                        \
+      if (!JIT_ENABLE_LDRSTR) return INTERPRET;                                       \
+      /* STR had NO such guard: every pre/post-index and writeback store was\
+         compiled with the same broken base writeback. */\
+      if (MODE != PRE_OP_IMM || REG_POS(i, 12) == 15 || REG_POS(i, 16) == 15) \
+         return INTERPRET;\
       currentBlock.WriteOP = true;                                                                                                                          \
       u32 val = get_addr(_ARMPROC.R[REG_POS(i, 16)], VAL, MODE, i);                                                                                         \
       /*if (is3DCMD(val))                                                                                                                                   \
@@ -1146,14 +1354,60 @@ u32 get_addr(u32 addr, s32 shift_op, u32 type, u32 i)
    }
 }
 
+// BISECT: 0 sends every single-word/byte LDR and STR to the interpreter.
+// LDM/STM are ruled out (verified: with them off ROMS/ldm.txt is never created and
+// the boot still fails), and the ARM9 JIT off entirely DOES boot -- so the fault
+// is codegen for some other family. Load/store is the next largest: difftest
+// reports LDR/STR 48/64.
+#define JIT_ENABLE_LDRSTR 1
+
+// Literal-pool fold: read a PC-relative word at compile time. SMC invalidation
+// only clears the slot of the written address, so a rewritten pool would go
+// stale -- acceptable because compilers never keep mutable data in pools and an
+// overlay load also rewrites (and so invalidates) the block start.
+static bool jit_fold_literal(u32 addr, u32 &val)
+{
+   if (!jit_opt_litfold || (addr & 3))
+      return false;
+   if ((addr >> 24) == 0x02 && (block_procnum || (addr & ~0x3FFF) != MMU.DTCMRegion))
+   {
+      val = T1ReadLong(MMU.MAIN_MEM, addr & _MMU_MAIN_MEM_MASK32);
+      return true;
+   }
+   if (!block_procnum && (addr & 0xFFFF8000) == 0xFFFF0000)
+   {
+      val = T1ReadLong(MMU.ARM9_BIOS, addr & 0x7FFC);
+      return true;
+   }
+   return false;
+}
+
+
+
 #define GEN_ARM_LDR_OP_FUNC(Name, MODE, VAL)                                           \
    static INSTR_R Name(uint32_t pc, const u32 i)                                       \
    {                                                                                   \
+      if (!JIT_ENABLE_LDRSTR) return INTERPRET;                                       \
       /* Only the plain immediate-OFFSET load (MODE==PRE_OP_IMM, P=1 W=0) is correct \
          in partial blocks; pre/post-index + writeback forms double the writeback and \
          compute the wrong address (difftest), so leave those to the interpreter. R15 \
          base/dest also interprets. This is the common LDR [Rn,#imm]. */               \
-      if (!full_block && (MODE != PRE_OP_IMM || REG_POS(i, 12) == 15 || REG_POS(i, 16) == 15)) \
+      /* !full_block REMOVED: the guard applied only to partial blocks, so a FULL\
+         block still compiled the broken pre/post-index writeback. That killed The\
+         Sims 3: its strlen at 020DC000 is "LDRB r1,[r0],#1; ADD r2,r2,#1; CMP\
+         r1,#0; BNE .-16" -- with the writeback wrong r0 never advances and the\
+         loop never ends; the PC trace stops dead there after 1152 blocks. */\
+      if (MODE == PRE_OP_IMM && REG_POS(i, 16) == 15 && REG_POS(i, 12) != 15)          \
+      {                                                                                \
+         u32 lit;                                                                      \
+         if (!jit_fold_literal(pc + 8 + (s32)(VAL), lit))                              \
+            return INTERPRET;                                                          \
+         interpreted_cycles += 2;                                                      \
+         currentBlock.addOP(OP_MOV, i, pc, REG_POS(i, 12), -1, -1, lit, PRE_OP_IMM,    \
+                            instr_is_conditional(i) ? CONDITION(i) : -1, EXTFL_NONE);  \
+         return DYNAREC;                                                               \
+      }                                                                                \
+      if (MODE != PRE_OP_IMM || REG_POS(i, 12) == 15 || REG_POS(i, 16) == 15) \
          return INTERPRET;                                                             \
       interpreted_cycles += 2;                                                         \
       u32 val = get_addr(_ARMPROC.R[REG_POS(i, 16)], VAL, MODE, i);                    \
@@ -1474,7 +1728,11 @@ static INSTR_R ARM_OP_LDM_STM(uint32_t pc, const u32 i)
          return INTERPRET;              // base register in load list
    }
 
+
    // Bisect switches: set to 0 to fall back to interpreter for that direction.
+   // BISECTED: with both forced to INTERPRET, The Sims 3 still boots to black.
+   // So this pair is NOT what breaks the boot (their 62/112 difftest failures are
+   // a separate, real bug -- see the doubled-offset note in blockdecoder.cpp).
    #define JIT_ENABLE_LDM 1
    #define JIT_ENABLE_STM 1
    if (load  && !JIT_ENABLE_LDM) return INTERPRET;
@@ -1562,36 +1820,63 @@ static const DynaCompiler arm_instruction_compilers[4096] = {
 // THUMB
 ////////
 
+// BISECT GROUP B: set to 0 to send the Thumb immediate shifts back to the
+// interpreter (i.e. undo this session's OP_SHIFT_S work) while hunting the
+// Sims 3 boot regression.
+#define JIT_THUMB_SHIFTS 1
+
+// Thumb immediate shifts. All six set N,Z and (except LSL #0) C, exactly as
+// OP_LSL/OP_LSR/OP_ASR in thumb_instructions.cpp do; they were interpreted, and
+// the ITP profiler measured ~910 fallbacks per 16384 blocks in this bucket.
+// The amount==0 encodings are distinct instructions in Thumb:
+//   LSL #0 -> plain move (C untouched), LSR #0 -> LSR #32, ASR #0 -> ASR #32.
+// OP_SHIFT_S carries the kind+amount in op.imm; see blockdecoder.h.
+
+static INSTR_R THUMB_OP_ASR_0_JIT(uint32_t pc, const u32 i)
+{
+   if (!JIT_THUMB_SHIFTS) return INTERPRET;
+   currentBlock.addOP(OP_SHIFT_S, i, pc, _REG_NUM(i, 0), _REG_NUM(i, 3), -1,
+                      SHIFT_S_PACK(SHIFT_S_ASR, 0));
+   return DYNAREC;
+}
+
 static INSTR_R THUMB_OP_ASR(uint32_t pc, const u32 i)
 {
-   return INTERPRET;
+   if (!JIT_THUMB_SHIFTS) return INTERPRET;
+   currentBlock.addOP(OP_SHIFT_S, i, pc, _REG_NUM(i, 0), _REG_NUM(i, 3), -1,
+                      SHIFT_S_PACK(SHIFT_S_ASR, (i >> 6) & 0x1F));
+   return DYNAREC;
 }
-
 static INSTR_R THUMB_OP_LSL_0(uint32_t pc, const u32 i)
 {
-   currentBlock.addOP(OP_MOV, i, pc, _REG_NUM(i, 0), _REG_NUM(i, 3));
+   if (!JIT_THUMB_SHIFTS) return INTERPRET;
+   // Was a bare OP_MOV, which leaves the flags alone -- but the interpreter
+   // sets N and Z here. OP_SHIFT_S does.
+   currentBlock.addOP(OP_SHIFT_S, i, pc, _REG_NUM(i, 0), _REG_NUM(i, 3), -1,
+                      SHIFT_S_PACK(SHIFT_S_LSL, 0));
    return DYNAREC;
 }
-
 static INSTR_R THUMB_OP_LSL(uint32_t pc, const u32 i)
 {
-   return INTERPRET;
-}
-
-static INSTR_R THUMB_OP_LSR_0(uint32_t pc, const u32 i)
-{
-   return INTERPRET;
-
-   printf("OP_LSR_0 not tested\n");
-   currentBlock.addOP(OP_LSR_0, i, pc, _REG_NUM(i, 0), _REG_NUM(i, 3));
+   if (!JIT_THUMB_SHIFTS) return INTERPRET;
+   currentBlock.addOP(OP_SHIFT_S, i, pc, _REG_NUM(i, 0), _REG_NUM(i, 3), -1,
+                      SHIFT_S_PACK(SHIFT_S_LSL, (i >> 6) & 0x1F));
    return DYNAREC;
 }
-
+static INSTR_R THUMB_OP_LSR_0(uint32_t pc, const u32 i)
+{
+   if (!JIT_THUMB_SHIFTS) return INTERPRET;
+   currentBlock.addOP(OP_SHIFT_S, i, pc, _REG_NUM(i, 0), _REG_NUM(i, 3), -1,
+                      SHIFT_S_PACK(SHIFT_S_LSR, 0));
+   return DYNAREC;
+}
 static INSTR_R THUMB_OP_LSR(uint32_t pc, const u32 i)
 {
-   return INTERPRET;
+   if (!JIT_THUMB_SHIFTS) return INTERPRET;
+   currentBlock.addOP(OP_SHIFT_S, i, pc, _REG_NUM(i, 0), _REG_NUM(i, 3), -1,
+                      SHIFT_S_PACK(SHIFT_S_LSR, (i >> 6) & 0x1F));
+   return DYNAREC;
 }
-
 static INSTR_R THUMB_OP_MOV_IMM8(uint32_t pc, const u32 i)
 {
    currentBlock.addOP(OP_MOV, i, pc, _REG_NUM(i, 8), -1, -1, i & 0xff, PRE_OP_IMM);
@@ -1767,13 +2052,13 @@ static INSTR_R THUMB_OP_B_UNCOND(uint32_t pc, const u32 i)
 
 static INSTR_R THUMB_OP_ADJUST_P_SP(uint32_t pc, const u32 i)
 {
-   currentBlock.addOP(OP_ADD, i, pc, 13, 13, -1, ((i & 0x7F) << 2), PRE_OP_IMM, EXTFL_NOFLAGS);
+   currentBlock.addOP(OP_ADD, i, pc, 13, 13, -1, ((i & 0x7F) << 2), PRE_OP_IMM, -1, EXTFL_NOFLAGS);
    return DYNAREC;
 }
 
 static INSTR_R THUMB_OP_ADJUST_M_SP(uint32_t pc, const u32 i)
 {
-   currentBlock.addOP(OP_ADD, i, pc, 13, 13, -1, -((i & 0x7F) << 2), PRE_OP_IMM, EXTFL_NOFLAGS);
+   currentBlock.addOP(OP_ADD, i, pc, 13, 13, -1, -((i & 0x7F) << 2), PRE_OP_IMM, -1, EXTFL_NOFLAGS);
    return DYNAREC;
 }
 
@@ -1924,7 +2209,7 @@ static INSTR_R THUMB_OP_BX_THUMB(uint32_t pc, const u32 i)
 
 #define THUMB_OP_UND_THUMB THUMB_OP_INTERPRET
 
-#define THUMB_OP_ASR_0 THUMB_OP_INTERPRET
+#define THUMB_OP_ASR_0 THUMB_OP_ASR_0_JIT
 
 #define THUMB_OP_LSL_REG THUMB_OP_INTERPRET
 #define THUMB_OP_LSR_REG THUMB_OP_INTERPRET
@@ -1951,7 +2236,11 @@ static INSTR_R THUMB_OP_LDR_PCREL(uint32_t pc, const u32 i)
 {
    // LDR Rd, [PC, #imm8*4]  — address constant-folded at JIT time
    uint32_t addr = ((pc + 4) & ~3u) + ((i & 0xFF) << 2);
-   currentBlock.addOP(OP_LDR, i, pc, _REG_NUM(i, 8), -1, -1, addr, PRE_OP_IMM, -1, EXTFL_NOFLAGS);
+   u32 lit;
+   if (jit_fold_literal(addr, lit))
+      currentBlock.addOP(OP_MOV, i, pc, _REG_NUM(i, 8), -1, -1, lit, PRE_OP_IMM, -1, EXTFL_NOFLAGS);
+   else
+      currentBlock.addOP(OP_LDR, i, pc, _REG_NUM(i, 8), -1, -1, addr, PRE_OP_IMM, -1, EXTFL_NOFLAGS);
    return DYNAREC;
 }
 
@@ -2081,6 +2370,7 @@ u8 jit_opt_constprop  = 1;
 u8 jit_opt_condmerge  = 1;
 u8 jit_opt_thumbflags = 1;
 u8 jit_opt_fastmem    = 0;   // experimental: default OFF until difftest-verified
+u8 jit_opt_litfold    = 1;
 
 // Return value of the chain: total cycles accumulated.
 extern "C" uint32_t cycles_to_return = 0;
@@ -2143,7 +2433,82 @@ int g_condLinkEnable = 0;
 // corruption (baseline with this OFF is clean). Turned ON here so the new multi-op
 // difftest (sweep_cmp_sequences) can reproduce the bug in a test instead of in-game.
 // Set back to 0 for a playable build until the sequence bug is fixed.
+//
+// TRIED AND REVERTED AGAIN (this session): adding the missing cross-block flag
+// store at the end of compile_basicblock -- the fix the earlier investigation
+// pointed at -- was NOT sufficient. With it plus g_jitCmpPartial=1, Layton
+// renders heavy colour/geometry corruption (same signature as before). So the
+// end-of-block store was a real gap and is KEPT (it is correct on its own), but
+// it is not what makes CMP-in-partial-blocks wrong. Something else in the
+// partial-block flag lifecycle is still off.
+//
+// Do not re-enable this without a test that reproduces the corruption; in-game
+// rebuild cycles have now burned two attempts.
 int g_jitCmpPartial = 0;
+
+// True when the block just built contained NO interpreter fallback. The difftest
+// needs this to report native vs interpreted honestly: it used to treat "a block
+// was produced" as native, which is also true for a block that is nothing but an
+// OP_ITP call, so interpreted opcodes were reported as native=1 and their diffs
+// looked like codegen bugs.
+bool g_last_block_was_native = false;
+
+// ---- PC trace ----------------------------------------------------------------
+// The Sims 3 boots with the ARM9 JIT off and shows a black screen with it on, and
+// bisecting by instruction family did not isolate it. So instead of guessing WHAT
+// breaks, record WHERE execution goes: every block the JIT compiles logs its
+// start PC into a ring buffer, dumped to ROMS/pctrace.txt on demand (SELECT in
+// the emu, see FrontEnd) or when the buffer wraps a set number of times.
+// Compilation order is a good proxy for execution order early in the boot: each
+// new PC appears the first time it is reached.
+#define PCTRACE_SIZE 4096
+u32  g_pctrace[PCTRACE_SIZE];
+u32  g_pctrace_pos   = 0;      // next write index
+u32  g_pctrace_total = 0;      // total blocks compiled
+int  g_pctrace_on    = 0;      // 0 disables recording
+
+extern "C" void pctrace_dump(void);
+
+extern "C" void pctrace_dump(void)
+{
+   char path[256];
+   if (!getcwd(path, sizeof(path) - 32)) return;
+   strcat(path, "/ROMS/pctrace.txt");
+   FILE *f = fopen(path, "w");
+   if (!f) return;
+   const u32 n = (g_pctrace_total < PCTRACE_SIZE) ? g_pctrace_total : PCTRACE_SIZE;
+   const u32 first = (g_pctrace_total < PCTRACE_SIZE) ? 0 : g_pctrace_pos;
+   fprintf(f, "blocks compiled: %u (last %u shown, oldest first)\n", g_pctrace_total, n);
+   for (u32 k = 0; k < n; k++)
+      fprintf(f, "%4u %08X\n", k, g_pctrace[(first + k) % PCTRACE_SIZE]);
+
+   // The trace shows 1151 DISTINCT PCs out of 1152 and then a dead stop -- no
+   // loop, so the game is not waiting on anything, it dies inside a block. Print
+   // the ARM instructions of the last few blocks so the offending opcode is
+   // visible without another round trip. 16 words each is well past a typical
+   // partial block (which ends at the first branch).
+   fprintf(f, "\nlast blocks, ARM source:\n");
+   const u32 show = (n < 6) ? n : 6;
+   for (u32 k = n - show; k < n; k++) {
+      const u32 pc = g_pctrace[(first + k) % PCTRACE_SIZE];
+      fprintf(f, "\n--- block %u @ %08X\n", k, pc);
+      for (u32 w = 0; w < 16; w++) {
+         const u32 a = pc + w * 4;
+         const u32 op = _MMU_read32<ARMCPU_ARM9, MMU_AT_DEBUG>(a);
+         fprintf(f, "  %08X: %08X\n", a, op);
+      }
+   }
+   fclose(f);
+   printf("[PCTRACE] %u blocks, wrote ROMS/pctrace.txt\n", g_pctrace_total);
+}
+
+
+// Measure where interpreter fallback actually goes before enabling more ops.
+// Enabling the S-op immediate forms produced no measurable speedup, so the
+// remaining OP_ITP cost is dominated by something else -- this prints the total
+// fallback ratio plus the 10 hottest opcode signatures every 16384 blocks.
+// Comment out once the hot list has been read.
+#define JIT_PROFILE_ITP 1
 
 #ifdef JIT_PROFILE_DISPATCH
 // Block-transition profiling: how many dispatcher hand-offs hit an already-compiled
@@ -2531,6 +2896,86 @@ void post_hle_block_emit(u32 block_start_addr, u32 base_adr, u32 interpreted_cyc
 
 
 bool first_time = true;
+
+// Hot-block profiler: each compiled ARM9 block bumps its own counter on entry;
+// jit_hotblock_report() ranks blocks by hits*cycles and writes ROMS/hotblocks.txt
+// with a disassembly, to pick functions worth replacing natively. Rebuild with 1.
+#define JIT_HOTBLOCK_PROF 0
+
+#if JIT_HOTBLOCK_PROF
+struct HotBlock { u32 pc; u32 hits; u16 cycles; u8 thumb; u8 nops; };
+static HotBlock g_hot[8192];
+static u32 g_hot_n = 0;
+
+void jit_hotblock_report()
+{
+   static u16 idx[8192];
+   const u32 n = g_hot_n;
+   for (u32 k = 0; k < n; k++) idx[k] = k;
+   // A block recompiled after SMC gets a second entry: merge by (pc, mode).
+   std::sort(idx, idx + n, [](u16 a, u16 b) {
+      return g_hot[a].pc != g_hot[b].pc ? g_hot[a].pc < g_hot[b].pc : g_hot[a].thumb < g_hot[b].thumb;
+   });
+
+   struct Row { u32 pc; u64 score; u32 hits; u16 cycles; u8 thumb; u8 nops; };
+   static Row rows[8192];
+   u32 nr = 0;
+   u64 total = 0;
+   for (u32 k = 0; k < n; k++)
+   {
+      const HotBlock &h = g_hot[idx[k]];
+      const u64 s = (u64)h.hits * h.cycles;
+      total += s;
+      if (nr && rows[nr - 1].pc == h.pc && rows[nr - 1].thumb == h.thumb)
+      {
+         rows[nr - 1].score += s;
+         rows[nr - 1].hits  += h.hits;
+      }
+      else
+         rows[nr++] = { h.pc, s, h.hits, h.cycles, h.thumb, h.nops };
+   }
+   for (u32 k = 0; k < n; k++) g_hot[k].hits = 0;
+
+   const u32 top = nr < 40 ? nr : 40;
+   std::partial_sort(rows, rows + top, rows + nr, [](const Row &a, const Row &b) { return a.score > b.score; });
+
+   char dir[160], path[256];
+   if (!getcwd(dir, sizeof(dir))) return;
+   snprintf(path, sizeof(path), "%s/ROMS/hotblocks.txt", dir);
+   FILE *f = fopen(path, "w");
+   if (!f) return;
+   fprintf(f, "blocks=%u unique=%u total_cyc=%llu\n", (unsigned)n, (unsigned)nr, (unsigned long long)total);
+   for (u32 r = 0; r < top; r++)
+   {
+      const Row &w = rows[r];
+      fprintf(f, "\n#%u pc=%08X %s hits=%u cyc/blk=%u share=%.2f%%\n", (unsigned)r, (unsigned)w.pc,
+              w.thumb ? "THUMB" : "ARM", (unsigned)w.hits, (unsigned)w.cycles,
+              total ? 100.0 * (double)w.score / (double)total : 0.0);
+      const u32 lines = w.nops < 24 ? w.nops : 24;
+      for (u32 l = 0; l < lines; l++)
+      {
+         char txt[96] = {0};
+         const u32 a = w.pc + l * (w.thumb ? 2 : 4);
+         if (w.thumb)
+         {
+            const u32 ins = _MMU_read16<ARMCPU_ARM9, MMU_AT_DEBUG>(a);
+            des_thumb_instructions_set[ins >> 6](a, ins, txt);
+            fprintf(f, "  %08X: %04X      %s\n", (unsigned)a, (unsigned)ins, txt);
+         }
+         else
+         {
+            const u32 ins = _MMU_read32<ARMCPU_ARM9, MMU_AT_DEBUG>(a);
+            des_arm_instructions_set[INSTRUCTION_INDEX(ins)](a, ins, txt);
+            fprintf(f, "  %08X: %08X  %s\n", (unsigned)a, (unsigned)ins, txt);
+         }
+      }
+   }
+   fclose(f);
+}
+#else
+void jit_hotblock_report() {}
+#endif
+
 template <int PROCNUM>
 void compile_basicblock(bool interpret_only = false)
 {
@@ -2544,7 +2989,146 @@ void compile_basicblock(bool interpret_only = false)
          emit_nop();
    }
 
+   // --- CMP partial-vs-full codegen dump (diagnostic) -----------------------
+   // Compiles the first block containing a CMP twice -- once as it comes (a
+   // partial block) and once with full_block forced -- and writes both to file.
+   // Diffing the two shows what the partial path emits differently, which is
+   // what the in-game corruption comes from. Cheaper than another rebuild+test
+   // cycle, and it answers the question the previous two attempts guessed at.
+   if (g_dumpCmpBlock && !interpret_only && block_procnum == ARMCPU_ARM9)
+   {
+      // Look for an INTERESTING block, not merely the first one containing a
+      // CMP. The first CMP block turned out to be trivial boot code and the two
+      // dumps came out byte-identical, which told us nothing.
+      //
+      // What we want is a block where the condition predicate survives between
+      // instructions, because that is where a stale predicate can bite:
+      //   - more than one flag-setter, and/or
+      //   - an op with check_condition == false, i.e. the condition-merge pass
+      //     decided to reuse the previous op's predicate in $s4, and/or
+      //   - a conditional op AFTER a flag-setter (the CMP;B<cond> shape), and/or
+      //   - an OP_ITP mixed in, which breaks the block up.
+      int  n_flagset = 0, n_merged = 0, n_itp = 0, n_cond_after_flag = 0;
+      bool seen_flagset = false;
+
+      for (auto &op : currentBlock.opcodes)
+      {
+         if (op._op == OP_ITP) n_itp++;
+
+         const bool is_flagset = (op._op >= OP_CMP);
+         if (is_flagset) { n_flagset++; seen_flagset = true; }
+
+         if (!op.check_condition && op.condition != ((uint32_t)-1)) n_merged++;
+         if (seen_flagset && !is_flagset && op.condition != ((uint32_t)-1))
+            n_cond_after_flag++;
+      }
+
+      // Require a genuinely mixed block: at least one CMP-family op plus either
+      // a reused predicate or a following conditional. A lone CMP tells us
+      // nothing (proved: the previous dump).
+      const bool interesting =
+         (n_flagset >= 1) && (n_merged > 0 || n_cond_after_flag > 0 || n_flagset >= 2);
+
+      if (interesting)
+      {
+         g_dumpCmpBlock = 0;   // once only
+
+         const bool saved_full  = full_block;
+         const int  saved_cmpen = g_jitCmpPartial;
+         const u32  saved_last  = emit_Set(emit_getPointAdr());
+
+         // Write next to the ROMs, where the files are easy to get at, using
+         // the same cwd + "/ROMS" the ROM browser uses.
+         char dir[160], f_partial[256], f_full[256];
+         getcwd(dir, sizeof(dir));
+         snprintf(f_partial, sizeof(f_partial), "%s/ROMS/cmp_partial.bin", dir);
+         snprintf(f_full,    sizeof(f_full),    "%s/ROMS/cmp_full.bin",    dir);
+
+         printf("[CMPDUMP] pc=%08X ops=%u flagset=%d merged=%d condafter=%d itp=%d\n",
+                (unsigned)currentBlock.start_addr,
+                (unsigned)currentBlock.getNOpcodes(),
+                n_flagset, n_merged, n_cond_after_flag, n_itp);
+
+         // Per-op listing, so the disassembly can be read against the ARM ops
+         // that produced it instead of guessed at.
+         {
+            char f_ops[256];
+            snprintf(f_ops, sizeof(f_ops), "%s/ROMS/cmp_ops.txt", dir);
+            FILE *fo = fopen(f_ops, "w");
+            if (fo)
+            {
+               fprintf(fo, "block pc=%08X ops=%u flagset=%d merged=%d condafter=%d itp=%d\n",
+                       (unsigned)currentBlock.start_addr,
+                       (unsigned)currentBlock.getNOpcodes(),
+                       n_flagset, n_merged, n_cond_after_flag, n_itp);
+               int idx = 0;
+               for (auto &op : currentBlock.opcodes)
+               {
+                  fprintf(fo, "%2d op=%-3d pc=%08X rd=%-3d rs1=%-3d rs2=%-3d imm=%08X "
+                              "cond=%X check=%d pre=%d xf=%u\n",
+                          idx++, (int)op._op, (unsigned)op.op_pc,
+                          (int)op.rd, (int)op.rs1, (int)op.rs2, (unsigned)op.imm,
+                          (unsigned)op.condition, (int)op.check_condition,
+                          (int)op.preOpType, (unsigned)op.extra_flags);
+               }
+               fclose(fo);
+            }
+         }
+
+         // Pass 1: partial block, CMP JIT'd (the broken configuration).
+         full_block = false;
+         g_jitCmpPartial = 1;
+         StartCodeDump();
+         currentBlock.emitArmBlock<PROCNUM>();
+         CodeDump(f_partial);
+         const u32 len_partial = emit_getPointAdr();
+
+         // Pass 2: same ops, full_block (the configuration known to be correct).
+         emit_Set(saved_last);
+         full_block = true;
+         StartCodeDump();
+         currentBlock.emitArmBlock<PROCNUM>();
+         CodeDump(f_full);
+
+         printf("[CMPDUMP] partial=%u full=%u bytes\n",
+                (unsigned)(len_partial - saved_last),
+                (unsigned)(emit_getPointAdr() - saved_last));
+
+         // Rewind and restore: the real compile below emits for keeps.
+         //
+         // emitArmBlock() runs three times over this block (twice here, once for
+         // real). It resets regman and reloads flags itself at entry, but
+         // flag_dirty is left set by whichever op wrote flags last, so clear it
+         // -- otherwise the real compile starts with a stale dirty flag and
+         // emits a store for flags this pass never produced.
+         extern bool flag_dirty;
+         extern bool flag_loaded;
+         flag_dirty  = false;
+         flag_loaded = false;
+
+         emit_Set(saved_last);
+         full_block = saved_full;
+         g_jitCmpPartial = saved_cmpen;
+      }
+   }
+
    void *code_ptr = emit_GetPtr();
+
+#if JIT_HOTBLOCK_PROF
+   HotBlock *hot = NULL;
+   if (!interpret_only && block_procnum == ARMCPU_ARM9 && g_hot_n < sizeof(g_hot) / sizeof(g_hot[0]))
+   {
+      hot = &g_hot[g_hot_n++];
+      hot->pc    = currentBlock.start_addr;
+      hot->hits  = 0;
+      hot->thumb = thumb;
+      hot->nops  = currentBlock.getNOpcodes() > 255 ? 255 : currentBlock.getNOpcodes();
+      emit_li(psp_t0, (u32)&hot->hits);
+      emit_lw(psp_t1, psp_t0, 0);
+      emit_addiu(psp_t1, psp_t1, 1);
+      emit_sw(psp_t1, psp_t0, 0);
+   }
+#endif
 
    // Idle-loop detection is DISABLED: it deadlocks the ARM9 in this tree.
    //
@@ -2573,6 +3157,23 @@ void compile_basicblock(bool interpret_only = false)
          currentBlock.emitArmBlock<PROCNUM>();
       }
 
+      // Flags live in psp_gp while a block runs and only reach ARMPROC.CPSR when
+      // store_flags() emits the sb. Nothing did that at the end of a block, so a
+      // flag-setter as the last op (very common: CMP right before a branch that
+      // lands in the NEXT block) left its result in a register the next block
+      // does not inherit -- the following conditional then tested stale flags.
+      //
+      // This is the cross-block flag bug that made CMP-in-partial-blocks black
+      // screen, and it blocks the S-ops for the same reason. One instruction,
+      // and only when a flag-setter actually ran.
+      extern bool flag_dirty;
+      extern void store_flags();
+      if (flag_dirty)
+      {
+         store_flags();
+         flag_dirty = false;
+      }
+
       // Always sync instruct_adr ← next_instr so the exit path and dispatch are correct.
       // For JumpOP/manualPrefetch, next_instr was written by the branch handler.
       // For sequential blocks, next_instr was stored by the last emit_prefetch call.
@@ -2590,6 +3191,9 @@ void compile_basicblock(bool interpret_only = false)
    emit_sb(psp_at, RCPU, offsetof(armcpu_t, idle_loop));
 
    const uint32_t blk_cycles = interpreted_cycles ? interpreted_cycles : 1;
+#if JIT_HOTBLOCK_PROF
+   if (hot) hot->cycles = blk_cycles > 0xFFFF ? 0xFFFF : blk_cycles;
+#endif
 
    // Determine the next compiled block for inline dispatch:
    //  1. Early-termination reuse: block building stopped because this PC already
@@ -2762,6 +3366,18 @@ void build_ArmBasicblock(uint16_t max_opcodes = 128, bool include_branches = fal
    const u32 isize = 4;
    const uint32_t imask = 0xFFFFFFFC;
 
+   if (g_pctrace_on) {
+      g_pctrace[g_pctrace_pos] = base_adr;
+      g_pctrace_pos = (g_pctrace_pos + 1) % PCTRACE_SIZE;
+      g_pctrace_total++;
+      // Dump PERIODICALLY, not only when the buffer fills: a boot that wedges
+      // early never reaches 4096 blocks, so the file was never written at all.
+      // Rewriting every 64 blocks means the last dump always reflects the most
+      // recent state, and the ring keeps the newest 4096 entries.
+      if ((g_pctrace_total & 63) == 0)
+         pctrace_dump();
+   }
+   g_last_block_was_native = true;   // cleared below by any INTERPRET fallback
    full_block = include_branches;
 
 #if defined(JIT_BUILD_HASH) || defined(save_hash)
@@ -2787,8 +3403,15 @@ void build_ArmBasicblock(uint16_t max_opcodes = 128, bool include_branches = fal
 
       uint32_t op = _MMU_read32<PROCNUM, MMU_AT_CODE>(pc & imask);
 
+      // JIT_ALL_ITP: keep the JIT's block machinery (compile, block table,
+      // dispatch, invalidation) but make every instruction fall back to the
+      // interpreter. If the boot is still broken like this, the fault is NOT in
+      // instruction codegen -- it is in the block lookup/invalidation, which this
+      // still exercises. The ARM9 is wedged re-running a block for 0209B212, an
+      // address that holds 0000 padding and never appears in the compile trace,
+      // so JIT_COMPILED_FUNC is handing back a block that address never had.
       DynaCompiler fc = arm_instruction_compilers[INSTRUCTION_INDEX(op)];
-      INSTR_R res = fc == 0 ? INTERPRET : fc(pc, op);
+      INSTR_R res = (jit_itp_arm(PROCNUM) || fc == 0) ? INTERPRET : fc(pc, op);
 
       has_ended = (!include_branches && instr_is_branch(op)) || (opnum >= max_opcodes) || (!include_branches && isHaltHackInstruction(op));
 
@@ -2796,9 +3419,16 @@ void build_ArmBasicblock(uint16_t max_opcodes = 128, bool include_branches = fal
       currentBlock.MCROP = currentBlock.MCROP || is_mcr_mrc(op);
 
 
+      // Per-INSTRUCTION counters for the on-screen ITP ratio. g_total_ops used to
+      // be bumped once per block while g_itp_ops counted instructions, which is
+      // why the display read "ITP 144%".
+      g_total_ops++;
+
       if (res == INTERPRET)
       {
          currentBlock.addOP(OP_ITP, op, pc, -1, op, -1, -1, PRE_OP_NONE, instr_is_conditional(op) ? CONDITION(op) : -1);
+         g_last_block_was_native = false;
+         g_itp_ops++;
          if (!has_ended)
             contains_intr = true;
       }
@@ -2810,6 +3440,17 @@ void build_ArmBasicblock(uint16_t max_opcodes = 128, bool include_branches = fal
       if (has_ended && (!instr_does_prefetch(op) || res == INTERPRET)) // prefetch next instruction
          currentBlock.manualPrefetch = true;
 
+      // instr_cycles(op) was commented out here while the Thumb path (below) kept
+      // it, so ARM blocks under-reported their cycle cost: the per-instruction
+      // cycle count and the +2 for taken conditional branches were both lost.
+      // A block that claims fewer cycles than it costs lets the ARM9 run ahead of
+      // the scheduler, so events (VCount/DMA/timers/IPC) land late relative to
+      // the code that is waiting for them.
+      // BISECTING: instr_cycles(op) was re-enabled here earlier this session (it
+      // had been commented out for ARM while the Thumb path below kept it, so ARM
+      // blocks under-reported their cycle cost). That changes the cycle budget of
+      // EVERY ARM block, which is the widest-reaching change made today, so back
+      // it out first while hunting the Sims 3 boot regression.
       if (!include_branches)
          interpreted_cycles += op_decode[PROCNUM][false](); // + instr_cycles(op);
    }
@@ -2867,7 +3508,7 @@ void build_ThumbBasicblock()
       // }
 
       DynaCompiler fc = thumb_instruction_compilers[op >> 6];
-      INSTR_R res = fc == 0 ? INTERPRET : fc(pc, op);
+      INSTR_R res = (jit_itp_thumb(PROCNUM) || fc == 0) ? INTERPRET : fc(pc, op);
 
       if (res == INTERPRET)
          currentBlock.addOP(OP_ITP, op, pc, -1, op, -1, -1, PRE_OP_NONE, false);
@@ -2981,7 +3622,22 @@ bool emit_nitrosdk_func(uint32_t guest_pc, bool thumb)
 
    const uint32_t old_pc = pc;
 
-   if (nds.is_twl_sdk() && ((guest_pc & 0xFFFF000) == 0x1FF8000))
+   // MICROCODE SUBSTITUTION DISABLED for this tree.
+   //
+   // SHAKEHAND at 01FF8000 is an ARM9<->ARM7 boot handshake: each side bumps its
+   // own counter and spins until the other side bumps theirs. With the ARM7 in
+   // HLE (the tree this came from) nobody answered, so replacing the spin with
+   // "return immediately" was required. Here arm7_core_active is true and the
+   // real ARM7 answers, so the loop ends on its own.
+   // Its handler also crashes: PC lands at 0BFBFFC8 with LR 0BFBFEF0, both in the
+   // PSP's MIPS *stack* region rather than the code cache (084009A0) or the
+   // handler (08856CE8), and identical on every run. The jal reach was verified
+   // fine and every surrounding piece (run_block_chain, continue_cpu_dispatch,
+   // pre/post_hle_block_emit, emit_nitrosdk_func itself) is byte-identical to the
+   // HLE tree, so the fault is in how this tree gets into that call, not in the
+   // substitution -- and we do not need the substitution to chase it.
+   // check_nitro_sdk() itself stays wired up: SDK detection was genuinely missing.
+   if (false && nds.is_twl_sdk() && ((guest_pc & 0xFFFF000) == 0x1FF8000))
    {
       int idx = 0;
       constexpr int cycles[2] = {20, 7};
@@ -2999,6 +3655,18 @@ bool emit_nitrosdk_func(uint32_t guest_pc, bool thumb)
                    func.name,
                    old_pc,
                    "ARM9");
+
+            // The HLE handler reads guest state straight out of the armcpu_t
+            // struct (post_hle takes the return address from NDS_ARM9.R[14]), so
+            // every cached guest register must be in memory before the call.
+            // build_ArmBasicblock above left the register cache populated from
+            // its pattern-match pass; without this flush the handler saw a stale
+            // LR and returned to a garbage address -- the observed
+            // "Jump to invalid address" right after the substitution fires.
+            // (The jal reach was checked and is fine: cache and handler share the
+            // same top nibble.)
+            extern void jit_flush_reg_cache();   // blockdecoder.cpp
+            jit_flush_reg_cache();
 
             u32 addr = pre_hle_block_emit();
             emit_jal(func.hle_function);
@@ -3088,11 +3756,11 @@ u32 arm_jit_compile()
 
    // ARM9 only: the substituted microcode handlers operate on NDS_ARM9
    // directly, so they must never stand in for an ARM7 block.
-   /*if (PROCNUM == ARMCPU_ARM9 && emit_nitrosdk_func(pc, thumb))
+   if (PROCNUM == ARMCPU_ARM9 && emit_nitrosdk_func(pc, thumb))
    {
       ArmOpCompiled code_block = (ArmOpCompiled)JIT_COMPILED_FUNC(ARMPROC.instruct_adr, PROCNUM);
       return code_block();
-   }*/
+   }
 
    //return op_decode[PROCNUM][thumb]();
 
@@ -3283,15 +3951,29 @@ void check_nitro_sdk()
    {
       auto &inst = currentBlock.opcodes[i];
 
-      if (inst._op == OP_LDR)
-      {
-         if (inst.imm == -1)
-            continue;
+      // Accept OP_ITP too: the LDR writeback guard sends PC-relative literal
+      // loads to the interpreter, so they arrive here as OP_ITP with the raw
+      // opcode in rs1 rather than as OP_LDR. Decoding the opcode directly makes
+      // the scan independent of which forms the JIT happens to accept.
+      const bool is_itp_ldr =
+          (inst._op == OP_ITP) && ((((u32)inst.rs1 >> 26) & 3) == 1) &&
+          (((u32)inst.rs1 >> 20) & 1) && ((((u32)inst.rs1 >> 16) & 0xF) == 15);
 
+      if (inst._op == OP_LDR || is_itp_ldr)
+      {
          uint32_t current_pc = inst.op_pc;
-         uint32_t imm = inst.imm;
-         uint32_t pc_val = current_pc + 8;
-         uint32_t imm_addr = inst.preOpType & PRE_OP_IMM_PRE_P ? pc_val + imm : pc_val - imm;
+         uint32_t imm, pc_val = current_pc + 8, imm_addr;
+
+         if (is_itp_ldr) {
+            const u32 raw = (u32)inst.rs1;
+            imm = raw & 0xFFF;
+            imm_addr = ((raw >> 23) & 1) ? pc_val + imm : pc_val - imm;
+         } else {
+            if (inst.imm == -1)
+               continue;
+            imm = inst.imm;
+            imm_addr = inst.preOpType & PRE_OP_IMM_PRE_P ? pc_val + imm : pc_val - imm;
+         }
          uint32_t imm_value = _MMU_ARM9_read32(imm_addr);
 
          if (oam_imm_load_found)

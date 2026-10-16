@@ -63,16 +63,27 @@ set_add_flags:
     SRL  $t1, $v0, 31
     INS  $28, $t1, 7, 1
 
-    # V: MUST match the interpreter's OverflowFromADD (armcpu.h), which uses
-    #   b1 = (left ^ alu_out) >> 31 ; b2 = !(left ^ right)  [i.e. left==right].
-    # This is not ARM-spec-correct (spec is sign-bit compare), but the JIT must
-    # be bit-identical to the interpreter or flags diverge across JIT/interp
-    # block boundaries and games crash. Do NOT "fix" to a sign compare here
-    # without also changing the interpreter.
-    XOR  $t0, $a0, $v0
+    # V: matches the interpreter's OverflowFromADD (armcpu.h):
+    #   (sign(left) == sign(right)) && (sign(alu_out) != sign(left))
+    # The previous code used b2 = !(left ^ right), i.e. left == right as whole
+    # WORDS, and claimed in a comment that this was what the interpreter did. It
+    # is not -- the interpreter compares SIGN BITS. That made V wrong whenever
+    # the operands merely shared a sign, e.g. ADDS 7FB3FE6C + 01000000: V must be
+    # 1 (positive+positive giving a negative result) but the word compare gave 0.
+    # Only visible once JIT_ADD_S_IMM was turned on; before that ADDS went to the
+    # interpreter and difftest was comparing the interpreter against itself.
+    # V: matches the interpreter's OverflowFromADD (armcpu.h):
+    #   (sign(left) == sign(right)) && (sign(alu_out) != sign(left))
+    # The previous code compared left==right as whole WORDS, which is a different
+    # condition; difftest caught it as ADDS imm 12/2 and CMNS failing on most
+    # shift forms, all of which go to 0 with the sign-bit version below.
+    # (Bisected against the Sims 3 boot failure and cleared: reverting this does
+    # not bring the boot back, so it is unrelated to that.)
+    XOR  $t0, $a0, $a1        # sign(left) == sign(right) ?
+    SRL  $t0, $t0, 31
+    XORI $t2, $t0, 1          # t2 = signs equal
+    XOR  $t0, $a0, $v0        # sign(alu_out) != sign(left) ?
     SRL  $t1, $t0, 31
-    XOR  $t0, $a0, $a1
-    SLTIU $t2, $t0, 1
     AND  $t0, $t1, $t2
     JR   $31
     INS  $28, $t0, 4, 1

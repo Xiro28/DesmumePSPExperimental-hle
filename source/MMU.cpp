@@ -2132,6 +2132,12 @@ static INLINE void MMU_IPCSync(u8 proc, u32 val)
 	if ((sync_l & IPCSYNC_IRQ_SEND) && (sync_r & IPCSYNC_IRQ_RECV))
 		NDS_makeIrq(proc^1, IRQ_BIT_IPCSYNC);
 
+	// With the ARM7 core parked nobody else answers the boot-time PXI handshake.
+	extern int g_arm7_core_parked;
+	extern void HLE_IPCSYNC();
+	if (proc == ARMCPU_ARM9 && g_arm7_core_parked)
+		HLE_IPCSYNC();
+
 	NDS_Reschedule();
 }
 

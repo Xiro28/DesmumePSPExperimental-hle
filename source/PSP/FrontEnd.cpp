@@ -1,3 +1,4 @@
+#include "../arm7_hle.h"
 #include <pspkernel.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -36,12 +37,16 @@ int totalSettingsDebug = 0; // Count of main settings plus debug settings
 
 SETTINGS expSettings[MAX_EXP_SETTINGS];  // Experimental optimizations tab
 int totalExp = 0;
+int g_arm9_mode_idx = -1;   // rows in expSettings[] that hold a 0..3 mode
+int g_arm7_mode_idx = -1;
+int g_arm7_hle_idx  = -1;   // row holding the 0..2 ARM7 HLE mode
 
 extern "C" const int g_jit_cycles_in_reg;   // reflects compile-time JIT_CYCLES_IN_REG
 extern unsigned char jit_opt_constprop;     // runtime JIT optimization toggles (arm_jit.h)
 extern unsigned char jit_opt_condmerge;
 extern unsigned char jit_opt_thumbflags;
 extern unsigned char jit_opt_fastmem;
+extern unsigned char jit_opt_litfold;
 
 //---------------------------------------------------------------------
 // Global variables used by the menus
@@ -185,12 +190,35 @@ void InitExperimentalSettings(configured_features *params)
 	c = addSetting(expSettings, c, "Suffix Reuse", "Stop block early when the remaining instructions are already compiled; jump into that block. Reduces code-cache usage and recompilation.", 1);
 	params->exp_early_term = expSettings[8].value;
 
+	c = addSetting(expSettings, c, "Literal Folding", "Compile PC-relative literal-pool loads as constants (no memory read). Disable to debug.", 1);
+
+	// Per-CPU JIT mode. Not a toggle: 0..4, cycled with LEFT/RIGHT.
+	//   0 Full JIT      everything compiled (default)
+	//   1 Half JIT      ARM compiled, Thumb interpreted
+	//   2 ITP At Boot   interpret until the first frame, then compile
+	//   3 JIT ITP       blocks/lookup/chaining active, all instructions interpreted
+	//   4 ITP til DTCM  interpret until the ARM9 relocates DTCM, then compile
+	c = addSetting(expSettings, c, "ARM9 JIT Mode", "LEFT/RIGHT. Full JIT: compile everything (fastest). Half JIT: compile ARM, interpret Thumb. ITP At Boot: interpret until the first frame, then compile. JIT ITP: keep block caching but interpret every instruction (slowest, most compatible). ITP til DTCM: interpret until the ARM9 relocates DTCM, then compile.", 0);
+	g_arm9_mode_idx = c - 1;
+	c = addSetting(expSettings, c, "ARM7 JIT Mode", "Same four modes as ARM9. The ARM7 runs on the interpreter in this build, so this only takes effect once its JIT is enabled.", 0);
+	g_arm7_mode_idx = c - 1;
+
+	// ARM7 HLE service ownership. Applies immediately, including mid-game.
+	c = addSetting(expSettings, c, "ARM7 HLE Mode", "LEFT/RIGHT. Sound Only: the HLE answers sound IPC, the real ARM7 core does the rest (default, the only audited setting). Core+Snd+Tch: the HLE also answers touch (breaks the stylus in Layton). Core Only: the HLE claims nothing. HLE Only: full HLE and the real ARM7 core stops being executed (the actual speed win; modes 0-2 keep the core running).", 0);
+	g_arm7_hle_idx = c - 1;
+	HLE_ApplyMode(expSettings[g_arm7_hle_idx].value);
+
 	totalExp = c;
+
+	extern int g_jit_mode[2];
+	g_jit_mode[0] = expSettings[g_arm9_mode_idx].value;
+	g_jit_mode[1] = expSettings[g_arm7_mode_idx].value;
 
 	jit_opt_constprop  = expSettings[3].value;
 	jit_opt_condmerge  = expSettings[4].value;
 	jit_opt_thumbflags = expSettings[5].value;
 	jit_opt_fastmem    = expSettings[6].value;
+	jit_opt_litfold    = expSettings[9].value;
 }
 
 void FinalizeExperimental(configured_features *params)
@@ -205,6 +233,16 @@ void FinalizeExperimental(configured_features *params)
 	jit_opt_condmerge  = expSettings[4].value;
 	jit_opt_thumbflags = expSettings[5].value;
 	jit_opt_fastmem    = expSettings[6].value;
+	jit_opt_litfold    = expSettings[9].value;
+
+	// JIT mode takes effect on the next block compiled; already-compiled blocks
+	// keep the code they were built with until the cache is reset.
+	extern int g_jit_mode[2];
+	if (g_arm9_mode_idx >= 0) g_jit_mode[0] = expSettings[g_arm9_mode_idx].value % 5;
+	if (g_arm7_mode_idx >= 0) g_jit_mode[1] = expSettings[g_arm7_mode_idx].value % 5;
+
+	// HLE ownership is a plain mask rewrite; no reset, effective next message.
+	if (g_arm7_hle_idx >= 0) HLE_ApplyMode(expSettings[g_arm7_hle_idx].value % 4);
 }
 
 
@@ -341,19 +379,40 @@ void DisplayExperimentalParms(int sel)
 	pspDebugScreenSetTextColor(0xff00ff00);
 	pspDebugScreenPrintf("[ JIT EXPERIMENTAL ]\n");
 
+	// The two JIT-mode rows show a mode name; everything else is ON/OFF.
+	static const char *kJitModeNames[5] = {
+	    "0 Full JIT",      // everything compiled                    (fastest)
+	    "1 JIT ARM only",  // ARM compiled, Thumb interpreted
+	    "2 ITP->1st frame",// interpret, compile after the first frame
+	    "3 All Interp",    // block cache kept, every op interpreted (slowest)
+	    "4 ITP->DTCM",     // interpret, compile once DTCM is moved
+	};
+
+	// Named after what the real ARM7 CORE does, because that is what decides
+	// both speed and compatibility. In 0-2 the core runs and the only question
+	// is who answers IPC; only 3 stops executing it, which is the mode that
+	// actually gets the old HLE-only speed back.
+	static const char *kHleModeNames[4] = {
+	    "0 Core+Snd HLE",  // core runs; HLE answers sound only  (default, audited)
+	    "1 Core+Snd+Tch",  // core runs; HLE answers sound + touch
+	    "2 Core Only",     // core runs; HLE answers nothing
+	    "3 No Core (HLE)", // core STOPPED; HLE answers everything (fastest)
+	};
+
 	for (int i = 0; i < totalExp; i++, yPos++)
 	{
+		const bool is_mode = (i == g_arm9_mode_idx || i == g_arm7_mode_idx);
+		const bool is_hle  = (i == g_arm7_hle_idx);
+		const char *val = is_mode
+		    ? kJitModeNames[expSettings[i].value % 5]
+		    : is_hle
+		    ? kHleModeNames[expSettings[i].value % 4]
+		    : (expSettings[i].value ? "ON" : "OFF");
+
 		pspDebugScreenSetXY(5, yPos);
-		if (i == sel)
-		{
-			pspDebugScreenSetTextColor(0xffffff00);
-			pspDebugScreenPrintf("> %-18s : %s\n", expSettings[i].name, expSettings[i].value ? "ON" : "OFF");
-		}
-		else
-		{
-			pspDebugScreenSetTextColor(0xffffffff);
-			pspDebugScreenPrintf("  %-18s : %s\n", expSettings[i].name, expSettings[i].value ? "ON" : "OFF");
-		}
+		pspDebugScreenSetTextColor((i == sel) ? 0xffffff00 : 0xffffffff);
+		pspDebugScreenPrintf("%s %-18s : %s\n", (i == sel) ? ">" : " ",
+		                     expSettings[i].name, val);
 	}
 
 	yPos += 4;
@@ -514,6 +573,11 @@ bool LoadRomConfig(const char *romPath)
 				if (strcmp(expSettings[i].name, key) == 0) { expSettings[i].value = val; break; }
 	}
 	fclose(f);
+
+	// Full JIT is forced on: a stale .cfg from the mode-bisection sessions must
+	// not silently put a CPU back on the interpreter.
+	if (g_arm9_mode_idx >= 0) expSettings[g_arm9_mode_idx].value = 0;
+	if (g_arm7_mode_idx >= 0) expSettings[g_arm7_mode_idx].value = 0;
 	return true;
 }
 
@@ -910,16 +974,28 @@ void RomSettingsMenu()
 				else if (pad.Buttons & PSP_CTRL_RIGHT)
 					StepSetting(+1);
 			}
-			else // Experimental tab (all boolean toggles)
+			else // Experimental tab: booleans, the 0..4 JIT rows, the 0..2 HLE row
 			{
+				const bool is_mode =
+				    (expSel == g_arm9_mode_idx || expSel == g_arm7_mode_idx);
+				const bool is_hle = (expSel == g_arm7_hle_idx);
+				const int  span   = is_mode ? 5 : is_hle ? 4 : 0;
+
 				if (pad.Buttons & PSP_CTRL_UP)
 					expSel = (expSel - 1 + totalExp) % totalExp;
 				else if (pad.Buttons & PSP_CTRL_DOWN)
 					expSel = (expSel + 1) % totalExp;
 				else if (pad.Buttons & PSP_CTRL_LEFT)
-					expSettings[expSel].value = 0;
+					expSettings[expSel].value = span
+					    ? (expSettings[expSel].value + span - 1) % span
+					    : 0;
 				else if (pad.Buttons & PSP_CTRL_RIGHT)
-					expSettings[expSel].value = 1;
+					expSettings[expSel].value = span
+					    ? (expSettings[expSel].value + 1) % span
+					    : 1;
+
+				// The HLE mask is read per IPC message, so this is live.
+				if (is_hle) HLE_ApplyMode(expSettings[expSel].value);
 			}
 		}
 	}

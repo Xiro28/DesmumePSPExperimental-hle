@@ -61,8 +61,19 @@
 #include"PSP/pspDmac.h"
 #include"PSP/PSPDisplay.h"
 
+// me_engine.cpp replaces libME: it brings the Media Engine up itself and owns
+// isEmu, which is false only once the ME is actually running. Shadow libME's
+// IsEmu() with it so every existing !IsEmu() test now asks "is the ME live?"
+// rather than "are we on real hardware?" -- the distinction matters, because
+// initMeEngine() leaves isEmu true if kcalli.prx is missing or the interrupt
+// handler cannot be registered, and then the CPU path must be taken.
 #include "melib.h"
 #include "me.h"
+
+extern "C" uintptr_t jit_lookup_dbg(u32 adr);   // arm_jit.cpp: block-table probe
+extern bool isEmu;
+#undef IsEmu
+#define IsEmu() isEmu
 
 
 bool dolog = false;
@@ -226,10 +237,8 @@ void renderScreenFull()
 {
 	static bool upScreen = true;
 
-	for (int i = 0;i < 192;++i) 
+	for (int i = 0;i < 192;++i)
 		GPU_RenderLine((upScreen ? &MainScreen : &SubScreen), i, frameSkipper.ShouldSkip2D());
-
-	SPU_Emulate_core();
 
 	upScreen = !upScreen;
 }
@@ -245,6 +254,10 @@ void meUtilityDcacheWritebackInvalidateAll(void)
         asm volatile("cache 0x14, 0(%0)" : : "r" (i));
     }
 }
+
+// Set true by the Media Engine (cpuInterruptHandler in me_engine.cpp) when it
+// has finished a 2D frame. Starts true so the first frame is dispatched.
+bool drawn = true;
 
 
 int renderScreen(JobData data)
@@ -295,7 +308,7 @@ int NDS_Init()
 	nds.idleFrameCounter = 0;
 	memset(nds.runCycleCollector,0,sizeof(nds.runCycleCollector));
 
-	J_Init(false);
+	// J_Init: libME init, superseded by initMeEngine() called from main().
 
 	MMU_Init();
 	
@@ -604,8 +617,14 @@ bool GameInfo::loadROM(std::string fname, u32 type)
 	return false;
 }
 
+void rom_cache_clear();
+
 void GameInfo::closeROM()
 {
+	// The cache holds blocks of the file we are about to close; a different ROM
+	// would otherwise be read through stale blocks.
+	rom_cache_clear();
+
 	if (fROM)
 		fclose(fROM);
 
@@ -618,10 +637,42 @@ void GameInfo::closeROM()
 	lastReadPos = 0xFFFFFFFF;
 }
 
-#include <unordered_map>
+// --- ROM read cache ---------------------------------------------------------
+// Cart reads come in runs: the loader streams whole sections, and games read
+// their assets in order. A per-word map was the wrong shape for that -- an
+// unordered_map<u32,u32> spends ~32-48 bytes of node and hashing overhead per
+// 4 bytes of payload, and it made every access a hash lookup plus a possible
+// allocation.
+//
+// This is a small set-associative cache of aligned blocks instead: one file
+// read fills a whole block, so a sequential run costs one read per block rather
+// than one per word, and the memory is a fixed flat array with no allocation
+// and no fragmentation.
+//
+// It also fixes a correctness bug in the old code: it used `if (!data)` to mean
+// "not cached", so every ROM word that is legitimately 0x00000000 -- padding,
+// empty tables, cleared fields, which is a lot of a cart -- missed the cache and
+// re-read from disk every single time. Validity is tracked explicitly here.
+#define ROMCACHE_BLOCK_SHIFT 9                              // 512 bytes/block
+#define ROMCACHE_BLOCK_SIZE  (1u << ROMCACHE_BLOCK_SHIFT)
+#define ROMCACHE_WAYS        64                             // 32KB total
+#define ROMCACHE_INVALID     0xFFFFFFFFu
 
+struct RomCacheBlock
+{
+	u32 tag;                            // block index, ROMCACHE_INVALID if empty
+	u8  data[ROMCACHE_BLOCK_SIZE];
+};
 
-std::unordered_map<u32, u32> cached_rom;
+static RomCacheBlock rom_cache[ROMCACHE_WAYS];
+static bool rom_cache_inited = false;
+
+void rom_cache_clear()
+{
+	for (u32 i = 0; i < ROMCACHE_WAYS; i++)
+		rom_cache[i].tag = ROMCACHE_INVALID;
+	rom_cache_inited = true;
+}
 
 u32 GameInfo::readROM(u32 pos)
 {
@@ -648,35 +699,59 @@ u32 GameInfo::readROM(u32 pos)
 
 			return data;
 	#else
-		if (cached_rom.size() > 1024 * 128) cached_rom.clear();
+		if (!rom_cache_inited)
+			rom_cache_clear();
 
-		u32 data = cached_rom[pos];
+		const u32 block = pos >> ROMCACHE_BLOCK_SHIFT;
+		const u32 way   = block & (ROMCACHE_WAYS - 1);
+		RomCacheBlock &b = rom_cache[way];
 
-		if (!data)
+		if (b.tag != block)
 		{
-			if (lastReadPos != pos)
-				fseek(fROM, pos + headerOffset, SEEK_SET);
+			// Miss: pull in the whole block with one read. Short reads (past EOF)
+			// are padded with 0xFF, matching what the per-word path returned.
+			const u32 base = block << ROMCACHE_BLOCK_SHIFT;
 
-			u32 num = fread(&data, 1, 4, fROM);
+			fseek(fROM, base + headerOffset, SEEK_SET);
+			const size_t got = fread(b.data, 1, ROMCACHE_BLOCK_SIZE, fROM);
+			if (got < ROMCACHE_BLOCK_SIZE)
+				memset(b.data + got, 0xFF, ROMCACHE_BLOCK_SIZE - got);
 
-			//in case we didn't read enough data, pad the remainder with 0xFF
-			u32 pad = 0;
-			while(num<4)
+			b.tag = block;
+
+			// The shared file position no longer matches what the unbuffered
+			// path assumes, so invalidate its one-entry "last position" hint.
+			lastReadPos = 0xFFFFFFFF;
+		}
+
+		// A 4-byte read can straddle two blocks when pos is not 4-aligned. Rare
+		// (the cart bus is word-addressed) but reading past the block would take
+		// bytes from whatever the neighbouring way happens to hold.
+		const u32 off = pos & (ROMCACHE_BLOCK_SIZE - 1);
+		if (off + 4 <= ROMCACHE_BLOCK_SIZE)
+			return LE_TO_LOCAL_32(*(u32*)(b.data + off));
+
+		u32 data = 0;
+		for (u32 i = 0; i < 4; i++)
+		{
+			const u32 p  = pos + i;
+			const u32 bl = p >> ROMCACHE_BLOCK_SHIFT;
+			RomCacheBlock &nb = rom_cache[bl & (ROMCACHE_WAYS - 1)];
+
+			if (nb.tag != bl)
 			{
-				pad >>= 8;
-				pad |= 0xFF000000;
-				num++;
+				const u32 nbase = bl << ROMCACHE_BLOCK_SHIFT;
+				fseek(fROM, nbase + headerOffset, SEEK_SET);
+				const size_t got = fread(nb.data, 1, ROMCACHE_BLOCK_SIZE, fROM);
+				if (got < ROMCACHE_BLOCK_SIZE)
+					memset(nb.data + got, 0xFF, ROMCACHE_BLOCK_SIZE - got);
+				nb.tag = bl;
+				lastReadPos = 0xFFFFFFFF;
 			}
 
-			lastReadPos = (pos + num);
-
-			data = LE_TO_LOCAL_32(data) & ~pad | pad;
-
-			cached_rom[pos] = data;
-
-			return data;
-		}else
-			return data;
+			data |= ((u32)nb.data[p & (ROMCACHE_BLOCK_SIZE - 1)]) << (i * 8);
+		}
+		return data;
 	#endif
 }
 
@@ -1706,6 +1781,11 @@ static void execHardware_hstart_vblankEnd()
 static void execHardware_hstart_vblankStart()
 {
 	//printf("--------VBLANK!!!--------\n");
+	// ARM7 housekeeping the HLE must do while the real core is parked (mode 3):
+	// keypad state, frame counter, TWL sync flags. It self-gates on
+	// g_arm7_core_parked, so this is a no-op in every other mode.
+	executeARM7Stuff();
+
 	//fire vblank interrupts if necessary
 	for(int i=0;i<2;i++)
 		if(MMU.reg_IF_pending[i] & (1<<IRQ_BIT_LCD_VBLANK))
@@ -2102,6 +2182,14 @@ bool nds_loadstate(EMUFILE* is, int size)
 // armcpu_exec after each block.
 // Set either flag to false to drop that CPU back to the interpreter, which is
 // the reference implementation and the right thing to do when chasing a hang.
+//
+// ARM7 JIT is OFF: switching it on stops games from booting. The per-CPU tables
+// and the PROCNUM-aware codegen helpers are in place and it links and runs, so
+// the fault is somewhere in what ARM7 blocks actually emit -- not yet diagnosed.
+// jit_difftest.cpp is the tool for it: it runs each instruction through both the
+// JIT and the interpreter and reports the first divergence.
+// BISECT RESULT: with the ARM9 JIT off entirely, The Sims 3 boots. So the boot
+// failure IS in JIT codegen -- not in the HLE / ME / scheduler work.
 #define NDS_ARM9_USE_JIT true
 #define NDS_ARM7_USE_JIT false
 
@@ -2155,7 +2243,8 @@ void exec_cpu()
 		}
 		else
 		{
-			const bool cpufreeze = !!(NDS_ARM7.freeze & (CPU_FREEZE_WAIT_IRQ | CPU_FREEZE_OVERCLOCK_HACK));
+			const bool cpufreeze = g_arm7_core_parked ||
+				!!(NDS_ARM7.freeze & (CPU_FREEZE_WAIT_IRQ | CPU_FREEZE_OVERCLOCK_HACK));
 	
 			if (!cpufreeze && !nds.freezeBus)
 			{
@@ -2271,7 +2360,7 @@ void exec_cpu()
 		}
 		else
 		{
-			const bool frozen =
+			const bool frozen = g_arm7_core_parked ||
 				!!(NDS_ARM7.freeze & (CPU_FREEZE_WAIT_IRQ | CPU_FREEZE_OVERCLOCK_HACK));
 
 			if (!frozen && !nds.freezeBus)
@@ -2289,6 +2378,53 @@ void exec_cpu()
 		}
 
 		nds_timer = nds_timer_base + std::min(arm9, arm7);
+
+		// DIAGNOSTIC: which core stops making progress?
+		// The Sims 3 boots with the ARM9 JIT off and shows a black screen with it
+		// on. Print both cores' PCs periodically: if the ARM9 PC keeps changing
+		// while the ARM7 sits on one address (or vice versa) we know which side
+		// is stuck, and on what. Set g_cpu_trace to 0 to silence.
+		extern int g_cpu_trace;
+		if (g_cpu_trace) {
+			static u32 tick = 0;
+			static u32 last9 = 0, last7 = 0, same9 = 0, same7 = 0;
+			if (NDS_ARM9.instruct_adr == last9) same9++; else { same9 = 0; last9 = NDS_ARM9.instruct_adr; }
+			// One-shot dump of the guest code at the stuck PC. The interpreter runs
+			// this same code fine, so the fault is in what the JIT generated for it.
+			static bool dumped = false;
+			if (!dumped && same9 > 4000000) {
+				dumped = true;
+				const u32 base = NDS_ARM9.instruct_adr & ~1u;
+				const bool th  = NDS_ARM9.CPSR.bits.T != 0;
+				printf("[STUCK] a9=%08X %s R0=%08X R1=%08X R2=%08X R3=%08X R4=%08X\n",
+				       NDS_ARM9.instruct_adr, th ? "THUMB" : "ARM",
+				       NDS_ARM9.R[0], NDS_ARM9.R[1], NDS_ARM9.R[2],
+				       NDS_ARM9.R[3], NDS_ARM9.R[4]);
+				// Is the block table handing back an entry this PC never had?
+				// JIT_COMPILED_FUNC indexes on bits 27..14 / 13..1 only, so unrelated
+				// addresses can share a slot; and a stale entry survives if memory is
+				// rewritten (DMA, overlay load) without the slot being cleared.
+				printf("[STUCK] block entry for %08X = %08X\n",
+				       NDS_ARM9.instruct_adr,
+				       (unsigned)jit_lookup_dbg(NDS_ARM9.instruct_adr));
+				for (int w = -4; w < 12; w++) {
+					const u32 a = base + (th ? w * 2 : w * 4);
+					const u32 v = th ? (u32)_MMU_read16<ARMCPU_ARM9, MMU_AT_DEBUG>(a)
+					                 : _MMU_read32<ARMCPU_ARM9, MMU_AT_DEBUG>(a);
+					printf("  %08X: %0*X%s\n", a, th ? 4 : 8, (unsigned)v,
+					       (a == base) ? "   <== PC" : "");
+				}
+			}
+			if (NDS_ARM7.instruct_adr == last7) same7++; else { same7 = 0; last7 = NDS_ARM7.instruct_adr; }
+			if ((++tick & 0xFFFFF) == 0)
+				printf("[CPU] a9=%08X (stuck %u) frz9=%X idle9=%d  a7=%08X frz7=%X  IME9=%d IE9=%08X IF9=%08X IFpend=%08X\n",
+				       NDS_ARM9.instruct_adr, same9,
+				       (unsigned)NDS_ARM9.freeze, (int)NDS_ARM9.idle_loop,
+				       NDS_ARM7.instruct_adr, (unsigned)NDS_ARM7.freeze,
+				       (int)MMU.reg_IME[0], (unsigned)MMU.reg_IE[0],
+				       (unsigned)MMU.gen_IF<ARMCPU_ARM9>(),
+				       (unsigned)MMU.reg_IF_pending[ARMCPU_ARM9]);
+		}
 	}
 
 	// NOTE: do NOT reassign nds_timer from a pre-loop snapshot here. That rewound
@@ -2338,9 +2474,19 @@ void exec_hw()
 }
 
 
+int g_cpu_trace = 0;   // periodic ARM9/ARM7 PC trace, see exec_cpu
+
 void NDS_setup()
 {
-	// check_nitro_sdk() is HLE-only; not ported.
+	// Detect the Nitro SDK version from the ROM's module-params block. Without
+	// this nds.sdkValid stays false, and emit_nitrosdk_func() -- which
+	// substitutes known SDK microcode routines with native handlers -- returns
+	// immediately at its first line, so none of those substitutions ever happen.
+	// The function existed here but the call had been left out during the port
+	// ("HLE-only; not ported"), which is not accurate: the detection itself is
+	// plain ROM parsing and arm_jit.cpp:check_nitro_sdk() is fully present.
+	extern void check_nitro_sdk();
+	check_nitro_sdk();
 
 	u32 last_addr = emit_Set(0);
 	set_code_cache(NDS_exec_code);
@@ -2783,7 +2929,8 @@ bool NDS_FakeBoot()
 bool _HACK_DONT_STOPMOVIE = false;
 void NDS_Reset()
 {
-	if(!IsEmu()) J_EXECUTE_ME_ONCE(&renderScreen, (int)frameSkipper.ShouldSkip2D());
+	// libME job dispatch removed: me_engine.cpp drives the ME directly now
+	// (cpuSendInterrupt from desmume_cycle), so there is no job to queue here.
 
 	resetUserInput();
 
@@ -2816,7 +2963,7 @@ void NDS_Reset()
 
 	arm_jit_reset(true);
 
-	cached_rom.clear();
+	rom_cache_clear();
 
 	//initialize CP15 specially for this platform
 	//TODO - how much of this is necessary for firmware boot?

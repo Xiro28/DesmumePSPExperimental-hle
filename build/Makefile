@@ -8,6 +8,7 @@ SRCDIR = ../source
 OBJS = $(SRCDIR)/arm_instructions.o \
 $(SRCDIR)/arm_jit.o \
 $(SRCDIR)/arm7_hle.o \
+$(SRCDIR)/me_engine.o \
 $(SRCDIR)/hle_sound_nitro.o \
 $(SRCDIR)/wifi_hle.o \
 $(SRCDIR)/jit_difftest.o \
@@ -85,6 +86,7 @@ $(SRCDIR)/PSP/psp_sound.o \
 $(SRCDIR)/PSP/FastMemcpyPSP.o \
 $(SRCDIR)/PSP/DisableFPUExceptions.o \
 $(SRCDIR)/PSP/pspOpUtil.o \
+$(SRCDIR)/PSP/kcalli.o \
 $(SRCDIR)/sndsdl.o \
 $(SRCDIR)/sndpsp.o \
 $(SRCDIR)/ctrlssdl.o \
@@ -111,7 +113,7 @@ ASFLAGS = $(CFLAGS)
 INCDIR =  ./libs/include
 
 LIBDIR = ./libs/lib
-LIBS  =   -lME -ldynarec -lintrafont -lpspdmac -lpspaudiocodec -lpspmath -lpsppower -lglut -lpspgum  -lfreetype -lpng -lz  -lm -lpspgu -lpsphprm -lpspaudio -lstdc++ -lpspvfpu -lpsprtc
+LIBS  =   -ldynarec -lintrafont -lpspdmac -lpspaudiocodec -lpspmath -lpsppower -lglut -lpspgum  -lfreetype -lpng -lz  -lm -lpspgu -lpsphprm -lpspaudio -lstdc++ -lpspvfpu -lpsprtc
 LIBS += -lpspaudiolib -lpspvram  -lpspsdk -lpng -lm 
 
 EXTRA_TARGETS = EBOOT.PBP

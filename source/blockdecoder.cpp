@@ -10,6 +10,9 @@ uint32_t block_procnum = 0;
 
 #include "Disassembler.h"
 
+#include <cstdarg>    // ldm_log diagnostic
+#include <cstring>
+#include <unistd.h>
 #include <functional>
 #include <cmath>
 
@@ -40,11 +43,46 @@ u32 start_block = 0;
 block currentBlock;
 register_manager regman;
 
+// Spill every cached guest register to the armcpu_t struct and drop the mapping.
+// Needed before handing control to a C handler that reads guest state directly
+// (the NitroSDK microcode substitutions do: post_hle() takes the return address
+// from NDS_ARM9.R[14]). regman lives here because psp_sra.h is only included in
+// this translation unit.
+void jit_flush_reg_cache()
+{
+    regman.flush_all();
+    regman.reset();
+}
+
 bool flag_loaded = false;
 bool use_flags = false;
 bool islast_op = false;
 
 bool flag_dirty = false;
+
+// Diagnostic counter for the [LDM] decode log above. Set to 0 to silence.
+int g_dumpLdmCode = 0;    // dump the first W=1 LDM/STM block's MIPS (real compile only:
+                          // g_dumpCmpBlock is now 0, so no diagnostic pre-passes)
+u32 g_ldm_wb_count = 0;   // see the LDM/STM writeback diagnostic below
+int g_dumpLdmDecode = 0;  // >0 writes ROMS/ldm.txt; used to VERIFY that the
+                           // JIT_ENABLE_LDM/STM switches actually took effect
+                           // (an empty file proves nothing reached the codegen)
+
+// printf() here only reaches stdout, and the difftest's DTPRINT is static to
+// jit_difftest.cpp, so mirror the LDM decode log into its own file.
+static void ldm_log(const char *fmt, ...)
+{
+    char path[256];
+    if (!getcwd(path, sizeof(path) - 32)) return;
+    strcat(path, "/ROMS/ldm.txt");
+    FILE *f = fopen(path, "a");
+    if (!f) return;
+    va_list ap;
+    va_start(ap, fmt);
+    vfprintf(f, fmt, ap);
+    va_end(ap);
+    fclose(f);
+}
 
 void load_flags()
 {
@@ -61,6 +99,29 @@ void store_flags()
     {
         emit_sb(psp_gp, RCPU, _flags + 3);
         flag_loaded = false;
+    }
+}
+
+// Load the ARM carry flag into `dst`, from wherever it currently lives.
+//
+// ADC/SBC/RSC used to read it straight out of CPSR in memory with an lbu. That is
+// wrong whenever an earlier op in the SAME block already updated the flags: those
+// updates go into psp_gp (see the emit_ins(psp_gp, ..., _flag_C8, _flag_C8) sites)
+// and are only spilled to CPSR by store_flags() at the end of the block. So the
+// lbu returned a STALE carry. Difftest caught it as failures confined to the
+// carry-consuming S-variants -- SBCS imm failed 11 of 12 seeds -- while the
+// non-S forms, which never read C, passed everywhere.
+void load_carry(psp_gpr_t dst)
+{
+    if (use_flags && flag_loaded)
+    {
+        // Flags are live in psp_gp; CPSR in memory is behind.
+        emit_ext(dst, psp_gp, _flag_C8, _flag_C8);
+    }
+    else
+    {
+        emit_lbu(dst, RCPU, _flags + 3);
+        emit_ext(dst, dst, _flag_C8, _flag_C8);
     }
 }
 
@@ -138,18 +199,21 @@ std::function<void(psp_gpr_t src, psp_gpr_t dst, opcode &op)> arm_preop[] = {
         {
             // RRX: dst = (C << 31) | (src >> 1).
             emit_srl(dst, src, 1);
-#ifdef JIT_OPT_RRX_GP
-            if (flag_loaded) {
-                // Carry already in psp_gp — skip the lbu CPSR reload.
-                emit_ext(psp_t1, psp_gp, _flag_C8, _flag_C8);
-            } else {
-#endif
-            emit_lbu(psp_t1, RCPU, _flags + 3);           // CPSR top byte (NZCV at 7..4)
-            emit_ext(psp_t1, psp_t1, _flag_C8, _flag_C8); // isolate C
-#ifdef JIT_OPT_RRX_GP
-            }
-#endif
-            emit_ins(dst, psp_t1, 31, 1);              // insert 1 bit at position 31
+            // Read C from wherever it currently lives. Reading it straight out of
+            // CPSR was wrong for the S-variants: those run under
+            // conditional_branchless_flags with the flags live in psp_gp, and CPSR
+            // is only refreshed by store_flags() at end of block -- so RRX used a
+            // STALE carry and got bit 31 of the operand wrong. Difftest showed the
+            // non-S forms passing while every *S* rrx failed with the result
+            // differing in bit 31 alone.
+            load_carry(psp_t1);
+            // emit_ins takes (msb, lsb), NOT (pos, size): the macro forwards _msb
+            // straight through, unlike emit_ext which computes _msb-_lsb itself.
+            // Passing (31, 1) therefore inserted 31 bits starting at bit 1 and
+            // wrecked the whole register -- RRX failed in EVERY ALU family
+            // (jit produced Rn op 1: the operand had been reduced to 1). A
+            // single-bit insert needs msb == lsb, as the C-flag sites do.
+            emit_ins(dst, psp_t1, 31, 31);             // insert 1 bit AT bit 31
             return;
         }
 
@@ -349,7 +413,11 @@ INLINE void emit_bic(u32 dst, u32 a0, u32 a1)
 
 INLINE void emit_bici(u32 dst, u32 a0, u32 a1)
 {
-    emit_andi(dst, a0, ~a1);
+    // op.imm arrives ALREADY complemented: ARM_OP_BIC_IMM_VAL rewrites
+    // BIC Rd,Rn,#imm into OP_AND with ~imm. Complementing again here produced
+    // andi(dst, a0, ~~imm) whose low 16 bits could be 0 (e.g. BIC #0xFFFF0000
+    // -> op.imm=0x0000FFFF -> andi #0x0000 -> register zeroed instead of masked).
+    emit_andi(dst, a0, a1);
 }
 
 #define END_OP(_rd)                               \
@@ -405,6 +473,12 @@ INLINE void emit_bici(u32 dst, u32 a0, u32 a1)
         }                                                     \
     } while (0)
 
+// emit_subiu encodes -imm, not imm, so the 16-bit range check must be applied
+// to the value that actually lands in the instruction. Gating on imm let
+// op.imm==0xFFFF8000 (-32768) through: addiu then received +0x8000, which
+// sign-extends back to -32768 -- off by 65536.
+// is_sub16: subiu's immediate field receives -imm, so range-check that.
+static INLINE bool is_sub16(u32 v) { return is_s16(0u - v); }
 #define gen_nativeOP(opType, n_op, n_op_imm, sign)                                                          \
     template <bool imm, bool rev>                                                                           \
     void arm_##opType(opcode &op)                                                                           \
@@ -415,7 +489,7 @@ INLINE void emit_bici(u32 dst, u32 a0, u32 a1)
         const psp_gpr_t dst = (op.condition != -1) ? psp_at : (psp_gpr_t)regs[0];                           \
         if (imm)                                                                                            \
         {                                                                                                   \
-            if (!rev && is_##sign##16(op.imm))                                                              \
+            if (!rev && is_##sign##16(op.imm))                                              \
             {                                                                                               \
                 conditional_branchless(regs[0], dst,                                                        \
                                        {                                                                    \
@@ -452,8 +526,16 @@ gen_nativeOP(and, and, andi, u);
 gen_nativeOP(or, or, ori, u);
 gen_nativeOP(xor, xor, xori, u);
 gen_nativeOP(add, addu, addiu, s);
-gen_nativeOP(sub, subu, subiu, s);
+gen_nativeOP(sub, subu, subiu, sub);
 gen_nativeOP(bic, bic, bici, u);
+
+// Set by constant propagation on a load/store whose address is a compile-time
+// constant in ARM9 main RAM; op.imm then holds that address.
+static const uint32_t EXTFL_CONSTADDR = 256;
+// Set on a MUL/MLA whose Rs is a compile-time constant: its variable cycle cost
+// was already added to the block's static count, so don't compute it at run time.
+static const uint32_t EXTFL_MULCYC = 512;
+extern uint32_t interpreted_cycles;
 
 // Apply an IMM-shift to a compile-time constant.
 // Returns false for RRX (shift=0 ROR), which needs the carry flag at runtime.
@@ -561,6 +643,87 @@ void block::optimize_basicblock()
             // (OP_ITP, OP_LDR); compare/etc. (>= OP_CMP) also excluded.
             const bool is_alu_op = (op._op > OP_ITP && op._op < OP_LDR);
 
+            // Step M: MUL/MLA with a known Rs (rs2). The ARM9 cost depends only on
+            // Rs, so charge it statically (same count as emit_mul_cycles, also
+            // charged when the condition fails). Rs == 0 or 2^k becomes a MOV/shift
+            // (MUL) or MOV/ADD with shift (MLA; accumulator Rn lives in op.imm).
+            if ((op._op == OP_MUL || op._op == OP_MLA) && op.rs2 < 15 && consts[op.rs2].known)
+            {
+                const uint32_t v = consts[op.rs2].val;
+                uint32_t c = 4;
+                for (int k = 1; k <= 3; k++)
+                    if ((int32_t)v >> (8 * k) == (int32_t)v >> 31)
+                        c--;
+                interpreted_cycles += c;
+
+                const uint32_t rm = op.rs1;
+                if ((v & (v - 1)) == 0 && op.rd != 15)
+                {
+                    const bool mla = (op._op == OP_MLA);
+                    const uint32_t rn = (uint32_t)op.imm;
+                    if (v == 0 && !mla) {
+                        op._op = OP_MOV; op.rs1 = -1; op.rs2 = -1;
+                        op.imm = 0;      op.preOpType = PRE_OP_IMM;
+                    } else if (v == 0) {
+                        op._op = OP_MOV; op.rs1 = -1; op.rs2 = rn;
+                        op.imm = 0;      op.preOpType = PRE_OP_LSL_IMM;
+                    } else {
+                        op._op = mla ? OP_ADD : OP_MOV;
+                        op.rs1 = mla ? rn : (uint32_t)-1;
+                        op.rs2 = rm;
+                        op.imm = __builtin_ctz(v);
+                        op.preOpType = PRE_OP_LSL_IMM;
+                    }
+                }
+                else
+                    op.extra_flags |= EXTFL_MULCYC;
+            }
+
+            // Step R: shift-by-register with a known amount (Rs in op.imm).
+            // Rm known too -> the whole operand is a constant. Otherwise rewrite to
+            // an immediate shift, only for amounts whose immediate encoding means
+            // the same thing (0 -> LSL #0, 1..31). Non-S ALU ops ignore the
+            // shifter carry, so this is exact.
+            if (is_alu_op &&
+                (op.preOpType == PRE_OP_LSL_REG || op.preOpType == PRE_OP_LSR_REG ||
+                 op.preOpType == PRE_OP_ASR_REG || op.preOpType == PRE_OP_ROR_REG) &&
+                op.imm >= 0 && op.imm < 15 && consts[op.imm].known)
+            {
+                const uint32_t n = consts[op.imm].val & 0xFF;
+                if (op.rs2 < 15 && consts[op.rs2].known)
+                {
+                    const uint32_t v = consts[op.rs2].val;
+                    uint32_t r;
+                    switch (op.preOpType)
+                    {
+                    case PRE_OP_LSL_REG: r = n >= 32 ? 0 : v << n; break;
+                    case PRE_OP_LSR_REG: r = n >= 32 ? 0 : v >> n; break;
+                    case PRE_OP_ASR_REG: r = (uint32_t)((int32_t)v >> (n >= 32 ? 31 : n)); break;
+                    default:             r = (n & 31) ? ((v >> (n & 31)) | (v << (32 - (n & 31)))) : v; break;
+                    }
+                    if (op._op == OP_MVN) {
+                        op._op = OP_MOV;
+                        r = ~r;
+                    }
+                    op.preOpType = PRE_OP_IMM;
+                    op.imm       = (int32_t)r;
+                    op.rs2       = -1;
+                }
+                else
+                {
+                    const uint32_t amt = (op.preOpType == PRE_OP_ROR_REG) ? (n & 31) : n;
+                    if (amt == 0) {
+                        op.preOpType = PRE_OP_LSL_IMM;
+                        op.imm       = 0;
+                    } else if (amt < 32) {
+                        op.preOpType = (op.preOpType == PRE_OP_LSL_REG) ? PRE_OP_LSL_IMM :
+                                       (op.preOpType == PRE_OP_LSR_REG) ? PRE_OP_LSR_IMM :
+                                       (op.preOpType == PRE_OP_ASR_REG) ? PRE_OP_ASR_IMM : PRE_OP_ROR_IMM;
+                        op.imm       = (int32_t)amt;
+                    }
+                }
+            }
+
             // Step A: rs2 is const + IMM shift → fold the shift into an immediate.
             // e.g. "ADD rd, rn, rm LSL #n" → "ADD rd, rn, #(rm_val << n)"
             if (is_alu_op &&
@@ -570,17 +733,40 @@ void block::optimize_basicblock()
             {
                 uint32_t shifted;
                 if (apply_const_shift(op.preOpType, consts[op.rs2].val, (uint32_t)op.imm, shifted)) {
+                    // The PRE_OP_IMM emitter treats MVN as a plain li, so invert here.
+                    if (op._op == OP_MVN) {
+                        op._op  = OP_MOV;
+                        shifted = ~shifted;
+                    }
                     op.preOpType = PRE_OP_IMM;
                     op.imm       = (int32_t)shifted;
                     op.rs2       = -1;
                 }
             }
 
+            // Step E: rs1 const, rs2 a plain register -> swap so the constant
+            // becomes the immediate: "ADD rd, rK, rm" -> "ADD rd, rm, #K"
+            // (SUB <-> RSB). Saves loading rK into a host register.
+            if (is_alu_op &&
+                op.preOpType == PRE_OP_LSL_IMM && op.imm == 0 &&
+                op.rs1 < 15 && consts[op.rs1].known &&
+                op.rs2 < 15 && !consts[op.rs2].known &&
+                (op._op == OP_ADD || op._op == OP_AND || op._op == OP_ORR ||
+                 op._op == OP_EOR || op._op == OP_SUB || op._op == OP_RSB))
+            {
+                if (op._op == OP_SUB)      op._op = OP_RSB;
+                else if (op._op == OP_RSB) op._op = OP_SUB;
+                op.imm       = (int32_t)consts[op.rs1].val;
+                op.rs1       = op.rs2;
+                op.rs2       = -1;
+                op.preOpType = PRE_OP_IMM;
+            }
+
             // Step B: rs1 is const + PRE_OP_IMM → fold to a pure MOV #imm.
             // e.g. "ADD rd, rn, #k" where rn==const → "MOV rd, #(rn_val + k)"
-            // Only safe for unconditional ALU ops (never memory ops).
+            // Conditional ops become a conditional MOV (never for rd==PC).
             if (is_alu_op &&
-                unconditional &&
+                (unconditional || op.rd != 15) &&
                 op.preOpType == PRE_OP_IMM &&
                 op._op != OP_MOV &&
                 op.rs1 >= 0 && op.rs1 < 16 && consts[op.rs1].known)
@@ -594,7 +780,43 @@ void block::optimize_basicblock()
                 }
             }
 
+            // Single loads/stores. IR convention: loads rd=dest rs1=base, stores
+            // rd=base rs1=value. Only the plain offset form (PRE_OP_IMM) is free of
+            // writeback; every other addressing form may update the base.
+            const bool is_load  = (op._op == OP_LDR || op._op == OP_LDRH || op._op == OP_LDRSH || op._op == OP_LDRSB);
+            const bool is_store = (op._op == OP_STR || op._op == OP_STRH);
+            if (is_load || is_store)
+            {
+                const uint32_t base = is_store ? op.rd : op.rs1;
+                const uint32_t data = is_store ? op.rs1 : op.rd;
+                const bool plain = (op.preOpType == PRE_OP_IMM);
+
+                // Step D: known base -> constant address; plain ARM9 main RAM
+                // outside DTCM is then accessed directly (emit_const_mem).
+                if (plain && unconditional && block_procnum == ARMCPU_ARM9 &&
+                    base < 15 && data < 15 && consts[base].known)
+                {
+                    const uint32_t addr = consts[base].val + (uint32_t)op.imm;
+                    const uint32_t size = (op._op == OP_LDR || op._op == OP_STR) ? 4 :
+                                          (op._op == OP_LDRSB) ? 1 : 2;
+                    if ((addr >> 24) == 0x02 && (addr & (size - 1)) == 0 &&
+                        (addr & ~0x3FFFu) != MMU.DTCMRegion)
+                    {
+                        op.extra_flags |= EXTFL_CONSTADDR;
+                        op.imm = (int32_t)addr;
+                    }
+                }
+
+                if (!plain && base < 16) consts[base].known = false;
+                if (is_load && op.rd < 16) consts[op.rd].known = false;
+                continue;
+            }
+
             // Step C: update const table for the destination register.
+            // Other non-ALU ops may write rs1 too; UMULL/UMLAL write RdLo (imm).
+            if (!is_alu_op && op.rs1 >= 0 && op.rs1 < 16) consts[op.rs1].known = false;
+            if ((op._op == OP_UMUL || op._op == OP_UMLA) && op.imm >= 0 && op.imm < 16)
+                consts[op.imm].known = false;
             if (op.rd >= 0 && op.rd < 15) { // never track r15 (PC)
                 consts[op.rd].known = false;  // pessimistically invalidate first
 
@@ -643,7 +865,9 @@ void block::optimize_basicblock()
                 live &= ~(1u << op.rd);
             }
 
-            // Mark sources as live.
+            // Mark sources as live. For memory ops rd can be a read (a store's base).
+            if (!is_alu && op.rd >= 0 && op.rd < 16) live |= (1u << op.rd);
+            if (op._op == OP_SMLAXY) live |= (1u << (op.imm & 0xF));
             if (op.rs1 >= 0 && op.rs1 < 16) live |= (1u << op.rs1);
             if (op.rs2 >= 0 && op.rs2 < 16) live |= (1u << op.rs2);
             // REG-shift and MLA: shift-amount / accumulator register lives in imm field.
@@ -660,6 +884,14 @@ void block::optimize_basicblock()
 
 void block::optimize_basicblockThumb()
 {
+    // EXTFL_NOFLAGS ops (PC/SP-relative ADD, folded literal LDR) must leave NZCV
+    // alone, but only the OP_ADD emitter checks the flag -- OP_MOV would still
+    // write N/Z and break a following conditional branch. Always applied, it is
+    // a correctness rule, not an optimization.
+    for (opcode &op : opcodes)
+        if (op.extra_flags & EXTFL_NOFLAGS)
+            op.saveN = op.saveZ = op.saveC = op.saveV = false;
+
     if (!jit_opt_thumbflags)
         return;
 
@@ -1076,9 +1308,114 @@ void arm_halt_hack()
 	NDS_Reschedule();
 }
 
+// ---------------------------------------------------------------------------
+// Runtime cycle cost of an ARM multiply.
+//
+// On the ARM9 a multiply costs base+1 .. base+4 depending on how many
+// significant bytes the Rs operand has -- a runtime property of the VALUE, not
+// of the opcode, which is why instr_attributes marks these INSTR_CYCLES_V and
+// instr_cycles() cannot price them (it sees only the opcode and returns 0).
+// The interpreter charges the real cost in MUL_Mxx_END/MUL_UMxxL_END/
+// MUL_SMxxL_END; a compiled block charged nothing, so every multiply made the
+// ARM9 run ahead of the scheduler.
+//
+// The interpreter's test after each `v >>= 8` is:
+//   signed   (MUL/MLA/SMULL/SMLAL):  (v == 0) || (v == 0xFF..F)
+//   unsigned (UMULL/UMLAL):          (v == 0)
+// "zero or all-ones" means the bits above that point are all copies of bit 31,
+// so for the signed forms the test is `(Rs >> 8k) == (Rs >> 31)` arithmetic,
+// which is branchless. The unsigned forms compare against zero directly.
+//
+// Emits into psp_t0 the extra cycles (1..4) and adds them to RCYC. Clobbers
+// psp_t0/psp_t1/psp_t2 only -- all caller-save scratch here.
+static void emit_mul_cycles(psp_gpr_t rs, bool is_signed)
+{
+    // psp_t2 = the value each shifted form is compared against:
+    //   signed   -> sign propagation (Rs >> 31 arithmetic), i.e. 0 or ~0
+    //   unsigned -> 0
+    if (is_signed)
+        emit_sra(psp_t2, rs, 31);
+    else
+        emit_move(psp_t2, psp_zero);
+
+    // Start at 4 (the "all four bytes significant" case) and subtract for each
+    // threshold the value falls under. Counting down keeps it branchless: the
+    // three tests are independent and each contributes at most one step.
+    emit_movi(psp_t0, 4);
+
+    // k = 1, 2, 3  ->  shift by 8, 16, 24
+    for (int k = 1; k <= 3; k++)
+    {
+        if (is_signed)
+            emit_sra(psp_t1, rs, 8 * k);
+        else
+            emit_srl(psp_t1, rs, 8 * k);
+
+        // psp_t1 = (shifted == compare) ? 1 : 0
+        emit_xor(psp_t1, psp_t1, psp_t2);
+        emit_sltiu(psp_t1, psp_t1, 1);
+
+        // Each threshold met removes one cycle: 4 -> 3 -> 2 -> 1.
+        emit_subu(psp_t0, psp_t0, psp_t1);
+    }
+
+#if JIT_CYCLES_IN_REG
+    emit_addu(RCYC, RCYC, psp_t0);
+#else
+    emit_lui(psp_t9, DISP_HI(&executed_cycles));
+    emit_lw(psp_t1, psp_t9, DISP_LO(&executed_cycles));
+    emit_addu(psp_t1, psp_t1, psp_t0);
+    emit_sw(psp_t1, psp_t9, DISP_LO(&executed_cycles));
+#endif
+}
+
+// Direct MAIN_MEM access for EXTFL_CONSTADDR ops: no C call, so no register
+// flush either. Stores clear the word's JIT slots exactly as _write16/_write32 do.
+static void emit_const_mem(opcode &op)
+{
+    const uint32_t addr = (uint32_t)op.imm;
+    const uint32_t off  = addr & _MMU_MAIN_MEM_MASK;
+    const uint32_t host = (uint32_t)MMU.MAIN_MEM + off;
+    const uint32_t hi   = ((host + 0x8000) >> 16) & 0xFFFF;
+    const int32_t  lo   = (int16_t)(host & 0xFFFF);
+
+    if (op._op == OP_STR || op._op == OP_STRH)
+    {
+        int32_t regs[1] = {(int32_t)op.rs1};
+        regman.get(1, regs);
+        emit_li(psp_t1, (uint32_t)&JIT.MAIN_MEM[off >> 1]);
+        emit_sw(psp_zero, psp_t1, 0);
+        if (op._op == OP_STR)
+            emit_sw(psp_zero, psp_t1, 4);
+        emit_lui(psp_t1, hi);
+        if (op._op == OP_STR)
+            emit_sw(regs[0], psp_t1, lo);
+        else
+            emit_sh(regs[0], psp_t1, lo);
+        return;
+    }
+
+    int32_t regs[1] = {(int32_t)(op.rd | 0x10)};
+    regman.get(1, regs);
+    emit_lui(psp_t1, hi);
+    switch (op._op)
+    {
+    case OP_LDR:   emit_lw(regs[0], psp_t1, lo);  break;
+    case OP_LDRH:  emit_lhu(regs[0], psp_t1, lo); break;
+    case OP_LDRSH: emit_lh(regs[0], psp_t1, lo);  break;
+    default:       emit_lb(regs[0], psp_t1, lo);  break;   // OP_LDRSB
+    }
+    regman.mark_dirty((psp_gpr_t)regs[0]);
+}
+
 template <int PROCNUM>
 void emitARMOP(opcode &op, const bool last_op)
 {
+    if (op.extra_flags & EXTFL_CONSTADDR)
+    {
+        emit_const_mem(op);
+        return;
+    }
 
     const bool rd_allocated = regman.is_mapped(op.rd);
 
@@ -1306,8 +1643,7 @@ void emitARMOP(opcode &op, const bool last_op)
             }
             // Read C AFTER arm_preop: the register-shift preops use psp_v0/psp_v1
             // as scratch and would clobber the carry if it were loaded earlier.
-            emit_lbu(psp_v1, RCPU, _flags + 3);
-            emit_ext(psp_v1, psp_v1, _flag_C8, _flag_C8);
+            load_carry(psp_v1);
             emit_addu(dst, dst, psp_v1);
         });
         END_OP_CHKR15(regs[0]);
@@ -1329,8 +1665,7 @@ void emitARMOP(opcode &op, const bool last_op)
             }
             emit_subu(dst, (psp_gpr_t)regs[1], psp_t0);
             // Read C AFTER arm_preop (reg-shift preops clobber psp_v1).
-            emit_lbu(psp_v1, RCPU, _flags + 3);
-            emit_ext(psp_v1, psp_v1, _flag_C8, _flag_C8);
+            load_carry(psp_v1);
             emit_addu(dst, dst, psp_v1);
             emit_addiu(dst, dst, -1);
         });
@@ -1354,8 +1689,7 @@ void emitARMOP(opcode &op, const bool last_op)
                 emit_subu(dst, psp_t0, (psp_gpr_t)regs[1]);
             }
             // Read C AFTER arm_preop (reg-shift preops clobber psp_v1).
-            emit_lbu(psp_v1, RCPU, _flags + 3);
-            emit_ext(psp_v1, psp_v1, _flag_C8, _flag_C8);
+            load_carry(psp_v1);
             emit_addu(dst, dst, psp_v1);
             emit_addiu(dst, dst, -1);
         });
@@ -1381,6 +1715,10 @@ void emitARMOP(opcode &op, const bool last_op)
             { regman.get(3, regs); emit_mult(regs[1], regs[2]); emit_mflo(psp_at); },
             { regman.get(3, regs); emit_mult(regs[1], regs[2]); emit_mflo(regs[0]); });
 #endif
+        // Variable multiply cost, charged unconditionally: on ARM a failed
+        // condition still burns the cycles. Rs is op.rs2; MUL is a signed form.
+        if (!(op.extra_flags & EXTFL_MULCYC))
+            emit_mul_cycles((psp_gpr_t)regs[2], true);
         break;
     }
 
@@ -1403,6 +1741,9 @@ void emitARMOP(opcode &op, const bool last_op)
             { regman.get(4, regs); emit_mult(regs[1], regs[2]); emit_mflo(psp_at); emit_addu(psp_at, psp_at, regs[3]); },
             { regman.get(4, regs); emit_mult(regs[1], regs[2]); emit_mflo(psp_at); emit_addu(regs[0], psp_at, regs[3]); });
 #endif
+        // MLA base is 2; the variable part depends on Rs (op.rs2), signed form.
+        if (!(op.extra_flags & EXTFL_MULCYC))
+            emit_mul_cycles((psp_gpr_t)regs[2], true);
         break;
     }
 
@@ -1439,6 +1780,9 @@ void emitARMOP(opcode &op, const bool last_op)
             regman.mark_dirty((psp_gpr_t)regs[0]);
             regman.mark_dirty((psp_gpr_t)regs[1]);
         }
+        // UMULL: unsigned form, so the interpreter tests (v == 0) only.
+        // Rs is regs[3] in this case's layout.
+        emit_mul_cycles((psp_gpr_t)regs[3], false);
 #else
         // Without JIT_OPT_MULACC, ARM_OP_UMULL returns INTERPRET so this is dead.
 #endif
@@ -1479,6 +1823,8 @@ void emitARMOP(opcode &op, const bool last_op)
             regman.mark_dirty((psp_gpr_t)regs[0]);
             regman.mark_dirty((psp_gpr_t)regs[1]);
         }
+        // UMLAL: unsigned form; Rs is regs[3].
+        emit_mul_cycles((psp_gpr_t)regs[3], false);
 #else
         // Without JIT_OPT_MULACC, ARM_OP_UMLAL returns INTERPRET so this is dead.
 #endif
@@ -1806,6 +2152,15 @@ void emitARMOP(opcode &op, const bool last_op)
                 if (is_special_type) {
                     const int idx = getTypeIdx((opType)special_type);
 
+                    // Take |imm| for the barrel-shifter preop WITHOUT mutating
+                    // op.imm: emitARMOP takes `opcode &op` by reference and the
+                    // block is emitted more than once, so flipping the sign here
+                    // made it stick. On the next emission the negative (downward)
+                    // offset had become positive, and the post-index / write-back
+                    // forms then ADDED where they should subtract -- difftest saw
+                    // the offset applied with the wrong sign or twice (all 48
+                    // failures were P=0 or W=1; plain pre-index never writes back
+                    // and so never showed it).
                     op.imm = op.imm < 0 ? -op.imm : op.imm;
 
                     if (idx >= 0)
@@ -1989,6 +2344,15 @@ void emitARMOP(opcode &op, const bool last_op)
                 if (is_special_type) {
                     const int idx = getTypeIdx((opType)special_type);
 
+                    // Take |imm| for the barrel-shifter preop WITHOUT mutating
+                    // op.imm: emitARMOP takes `opcode &op` by reference and the
+                    // block is emitted more than once, so flipping the sign here
+                    // made it stick. On the next emission the negative (downward)
+                    // offset had become positive, and the post-index / write-back
+                    // forms then ADDED where they should subtract -- difftest saw
+                    // the offset applied with the wrong sign or twice (all 48
+                    // failures were P=0 or W=1; plain pre-index never writes back
+                    // and so never showed it).
                     op.imm = op.imm < 0 ? -op.imm : op.imm;
 
                     if (idx >= 0)
@@ -2188,6 +2552,27 @@ void emitARMOP(opcode &op, const bool last_op)
     {
         // op.bytes = full ARM opcode. Decode addressing form here.
         const u32 insn   = op.bytes;
+        // Diagnostic: log what this LDM/STM was decoded as, plus the computed
+        // start offset and writeback delta. Difftest shows the base register
+        // ending at Rn-8n instead of Rn-4n (offset applied twice) and one LDM
+        // reading all zeros, while the generator reads correct statically --
+        // so print the actual decoded values.
+        extern int g_dumpLdmDecode;
+        if (g_dumpLdmDecode > 0 && ((insn >> 21) & 1)) {   // W=1 only: the failing forms
+            g_dumpLdmDecode--;
+            int dn = 0;
+            for (u32 b = 0; b < 16; b++) if ((insn & 0xFFFF) & (1u << b)) dn++;
+            const bool dP = (insn >> 24) & 1, dU = (insn >> 23) & 1, dW = (insn >> 21) & 1;
+            ldm_log("[LDM] insn=%08X pc=%08X %s P=%d U=%d W=%d n=%d rlist=%04X "
+                   "rs1=%d rd=%d imm=%d pre=%d cond=%X first_off=%d wb=%d\n",
+                   (unsigned)insn, (unsigned)op.op_pc,
+                   (op._op == OP_LDM) ? "LDM" : "STM",
+                   (int)dP, (int)dU, (int)dW, dn, (unsigned)(insn & 0xFFFF),
+                   (int)op.rs1, (int)op.rd, (int)op.imm, (int)op.preOpType,
+                   (unsigned)op.condition,
+                   dU ? (dP ? 4 : 0) : (dP ? -(dn * 4) : -((dn - 1) * 4)),
+                   dU ? (dn * 4) : -(dn * 4));
+        }
         const bool load  = (op._op == OP_LDM);
         const bool P     = (insn >> 24) & 1;   // pre/post
         const bool U     = (insn >> 23) & 1;   // up/down
@@ -2198,6 +2583,14 @@ void emitARMOP(opcode &op, const bool last_op)
         int n = 0;
         for (u32 b = 0; b < 16; b++)
             if (rlist & (1u << b)) n++;
+
+        // DIAGNOSTIC: dump the MIPS emitted for the first W=1 block. wb_exec=1 in
+        // difftest proves the writeback runs exactly once, yet the base ends at
+        // Rn-8n instead of Rn-4n -- so something else in the emitted code also
+        // moves rn. Read the actual instructions instead of the generator.
+        extern int g_dumpLdmCode;
+        const bool dump_this = (g_dumpLdmCode > 0) && (((insn >> 21) & 1) != 0);
+        if (dump_this) { g_dumpLdmCode--; StartCodeDump(); }
 
         // psp_s5 holds the running effective address across the memory calls
         // (callee-saved, survives _read32/_write32). All NDS regs live in the
@@ -2256,6 +2649,16 @@ void emitARMOP(opcode &op, const bool last_op)
 
             regman.reset();
         )
+
+        if (dump_this) {
+            char path[256];
+            if (getcwd(path, sizeof(path) - 32)) {
+                strcat(path, "/ROMS/ldmcode.bin");
+                CodeDump(path);
+                printf("[LDMCODE] insn=%08X n=%d P=%d U=%d W=%d L=%d rn=%d dumped\n",
+                       (unsigned)insn, n, (int)P, (int)U, (int)W, (int)load, (int)rn);
+            }
+        }
     }
     break;
 
@@ -2485,6 +2888,57 @@ void emitARMOP(opcode &op, const bool last_op)
         break;
     }
 
+    case OP_SHIFT_S:
+    {
+        // Thumb LSL/LSR/ASR #imm, setting N,Z,C (V untouched). Mirrors
+        // OP_LSL / OP_LSR / OP_ASR in thumb_instructions.cpp, including the
+        // amount==0 forms which that file handles as separate opcodes:
+        //   LSL #0 : Rd = Rm            ; C unchanged
+        //   LSR #0 : Rd = 0             ; C = Rm>>31   (means LSR #32)
+        //   ASR #0 : Rd = Rm>>31 ? ~0:0 ; C = Rm>>31   (means ASR #32)
+        // Carry for a nonzero amount is the last bit shifted out:
+        //   LSL: bit (32-amt) ; LSR/ASR: bit (amt-1)
+        const uint32_t kind = SHIFT_S_KIND(op.imm);
+        const uint32_t amt  = SHIFT_S_AMT(op.imm);
+
+        int32_t regs[2] = {(op.condition != -1) ? op.rd : (op.rd | 0x10), op.rs1};
+        regman.get(2, regs);
+        const psp_gpr_t dst = (op.condition != -1) ? psp_at : (psp_gpr_t)regs[0];
+        const psp_gpr_t src = (psp_gpr_t)regs[1];
+
+        conditional_branchless_flags(regs[0], dst, psp_t3, {
+            if (amt == 0) {
+                if (kind == SHIFT_S_LSL) {
+                    // Rd = Rm, C untouched.
+                    emit_move(dst, src);
+                } else {
+                    // C = bit31 of Rm, computed BEFORE dst is written (dst may
+                    // alias src).
+                    emit_ext(psp_t0, src, 31, 31);
+                    if (kind == SHIFT_S_LSR)
+                        emit_move(dst, psp_zero);          // LSR #32 -> 0
+                    else
+                        emit_sra(dst, src, 31);            // ASR #32 -> sign
+                    emit_ins(psp_gp, psp_t0, _flag_C8, _flag_C8);
+                }
+            } else {
+                // Grab the carry bit first: dst can be the same register as src.
+                const uint32_t cbit = (kind == SHIFT_S_LSL) ? (32u - amt) : (amt - 1u);
+                emit_ext(psp_t0, src, cbit, cbit);
+                if (kind == SHIFT_S_LSL)      emit_sll(dst, src, amt);
+                else if (kind == SHIFT_S_LSR) emit_srl(dst, src, amt);
+                else                          emit_sra(dst, src, amt);
+                emit_ins(psp_gp, psp_t0, _flag_C8, _flag_C8);
+            }
+            // N and Z from the result.
+            emit_jal(set_op_logic_flags);
+            emit_move(psp_v0, dst);
+        });
+        set_flag_dirty();
+        END_OP_CHKR15(regs[0]);
+        break;
+    }
+
     case OP_STMIA:
     case OP_NOP:
     case OP_LSR_0:
@@ -2509,6 +2963,8 @@ bool block::emitThumbBlock()
 {
 
     use_flags = true;
+    flag_loaded = false;   // see the note in emitArmBlock()
+    flag_dirty  = false;
 
     // reg_alloc.reset(); 
 
@@ -2574,6 +3030,13 @@ bool block::emitArmBlock()
     intr_instr = 0;
 
     use_flags = uses_flags;
+    // flag_loaded / flag_dirty are file-scope globals that survive between block
+    // compilations. load_flags() only sets flag_loaded when use_flags is true, so a
+    // block that does not use flags left the PREVIOUS block's flag_loaded=true
+    // standing while psp_gp held nothing -- and consumers (the RRX carry fast path,
+    // check_flags) then trusted psp_gp. Reset both at block entry.
+    flag_loaded = false;
+    flag_dirty  = false;
 
     /*char * found = strstr(compiled_functions_hash, block_hash);
 
@@ -2595,8 +3058,23 @@ bool block::emitArmBlock()
     {
         if ((op._op == OP_ITP || op._op == OP_SWI))
         {
-            regman.flush_all();
-            regman.reset();
+            // Spill only what this interpreted instruction touches, instead of
+            // the whole cache. itp_reg_mask() returns all-ones for anything it
+            // cannot classify, which reproduces the old flush-everything path.
+            // OP_ITP keeps the raw opcode in rs1.
+            ItpRegMask m = (op._op == OP_ITP && g_itp_selective_flush)
+                               ? itp_reg_mask((u32)op.rs1)
+                               : ItpRegMask{0xFFFFu, 0xFFFFu};
+
+            if (m.read == 0xFFFFu && m.write == 0xFFFFu)
+            {
+                regman.flush_all();
+                regman.reset();
+            }
+            else
+            {
+                regman.flush_selective(m.read, m.write);
+            }
         }
 
         if (last_op.op_pc != op.op_pc)

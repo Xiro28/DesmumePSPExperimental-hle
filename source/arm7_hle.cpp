@@ -7,6 +7,38 @@
 #include "NDSSystem.h"
 #include "wifi_hle.h"
 
+#include <stdio.h>
+#include <stdarg.h>
+#include <unistd.h>
+
+extern int g_arm7_core_parked;
+
+// Mode-3 diagnostics. The build has no printf, so trace IPC traffic to
+// ROMS/hle_log.txt (flushed per line: the case being chased is a hang).
+static void hle_log(const char *fmt, ...)
+{
+    static FILE *f = NULL;
+    static int lines = 0;
+    if (!g_arm7_core_parked || lines >= 3000)
+        return;
+    if (!f)
+    {
+        char dir[160], path[256];
+        if (!getcwd(dir, sizeof(dir)))
+            return;
+        snprintf(path, sizeof(path), "%s/ROMS/hle_log.txt", dir);
+        f = fopen(path, "w");
+        if (!f)
+            return;
+    }
+    va_list ap;
+    va_start(ap, fmt);
+    vfprintf(f, fmt, ap);
+    va_end(ap);
+    fflush(f);
+    lines++;
+}
+
 
 namespace Sound_Nitro{
     extern void OnIPCRequest(u32 data);
@@ -50,6 +82,11 @@ void SendIPCReply(u32 service, u32 data, u32 flag)
 {
     u32 val = (service & 0x1F) | (data << 6) | ((flag & 0x1) << 5);
 
+    hle_log("  reply svc=%X data=%08X flag=%u  cnt7=%04X cnt9=%04X q7=%u\n",
+            (unsigned)service, (unsigned)data, (unsigned)flag,
+            (unsigned)(u16)IPCFIFOCnt7, (unsigned)(u16)IPCFIFOCnt9,
+            (unsigned)ipc_fifo[ARMCPU_ARM7].size);
+
     // The full-FIFO case is left to IPC_FIFOsend(): upstream's version already
     // sets FIFOERROR and updates both IPCFIFOCNT words. The -hle tree open-coded
     // it here because its rewritten FIFO.cpp kept those registers in globals;
@@ -79,10 +116,16 @@ void SendIPCReply(u32 service, u32 data, u32 flag)
 // listed here without auditing every path through its handler -- an unmodelled
 // request degrades into "the core handles it" rather than a deadlock.
 u32 HLE_SERVICE_MASK =
-      (1u << 0x6)   // touchscreen
-    | (1u << 0x7);  // sound (Nitro HLE)
+      (1u << 0x7);  // sound (Nitro HLE)
 
 // Not claimed:
+//   0x6 touch -- claiming it broke the stylus in Professor Layton. The real
+//     ARM7 core reports touch through the TSC over SPI, which is the path the
+//     PENIRQ/EXTKEYIN and ADC-scaling fixes were made against and which works.
+//     The HLE answers over IPC and writes a different shared-memory field
+//     instead; that is a second, parallel mechanism, and the game follows the
+//     core's. Offloading touch means making the HLE path complete, not just
+//     claiming the service.
 //   0xD cart -- do NOT add. OnIPCRequest_Cart() replies SendIPCReply(0xD, 0x1)
 //     with a `// TODO other shito?` next to it: a placeholder success for a
 //     service that is how the game loads data off the cartridge. Because it
@@ -94,6 +137,74 @@ u32 HLE_SERVICE_MASK =
 //   0x4 firmware, 0x5 RTC, 0x9 mic: not needed, the core handles them
 //   0xA wifi: needs a WIFI_HLE sequencer event this tree does not have
 
+
+// --- Runtime HLE mode -------------------------------------------------------
+// Switchable mid-game: HLE_handles() reads HLE_SERVICE_MASK on every message,
+// so changing the mask takes effect on the next IPC request. No reset needed --
+// unlike the JIT modes, nothing has been compiled against the old value.
+//
+// Switching is safe in one direction more than the other. Narrowing the mask
+// (HLE -> core) just means the core starts answering; it was running all along.
+// Widening it hands the HLE a service mid-conversation, and if the game is
+// waiting on a reply the core was about to send, that reply is lost. So the
+// widening cases are the ones to distrust when a game hangs right after a
+// switch.
+//
+//   0 Sound Only   what this tree shipped with, and the only audited setting
+//   1 Full HLE     every service the HLE has a handler for
+//   2 Core Only    HLE claims nothing; the real ARM7 does everything
+int g_hle_mode = 0;
+
+// Mode 3 only: stop stepping the real ARM7 core in exec_cpu. Modes 0-2 leave
+// the core running and merely move IPC ownership, so they cannot recover the
+// performance of an HLE-only ARM7.
+int g_arm7_core_parked = 0;
+
+void HLE_ApplyMode(int mode)
+{
+    g_hle_mode = mode;
+    g_arm7_core_parked = (mode == 3);
+    switch (mode)
+    {
+    case 1:
+        // Sound + touch. This is the widest set the tree ever bisected as
+        // working ("sound alone works, sound+touch works"), and nothing more.
+        //
+        // An earlier version of this mode also claimed 0x4/0x5/0x8/0x9/0xB on
+        // the reasoning that a handler existed for each. That was wrong, and it
+        // stopped Pokemon from booting: the file documents 0x8 (powerman) and
+        // 0xB (cart save) as "deliberately the real core's job", and 0x4/0x5/0x9
+        // as "not needed, the core handles them". A handler existing is not
+        // evidence it is complete -- several reply to inputs they do not model.
+        //
+        // 0x6 (touch) is claimed here despite breaking the stylus in Layton;
+        // that is the documented trade-off of leaving Sound Only.
+        HLE_SERVICE_MASK = (1u << 0x6) | (1u << 0x7);
+        break;
+    case 2:
+        HLE_SERVICE_MASK = 0;
+        break;
+    case 3:
+        // Core parked (g_arm7_core_parked, see NDSSystem.cpp): modes 0-2 only
+        // move IPC ownership and the real ARM7 keeps executing either way,
+        // which is why they cannot restore HLE-only speed.
+        //
+        // The mask stays wide here for a reason that does NOT apply to mode 1:
+        // with the core stopped, a service the HLE declines is answered by
+        // nobody at all. So the weak handlers that made mode 1 break Pokemon
+        // are claimed anyway -- a weak answer beats no answer once there is no
+        // core to fall back on. 0xD (cart) is still excluded: its placeholder
+        // Every service is claimed: an unclaimed message stays at the FIFO
+        // head forever (no core reads it) and HLE_DrainIPC() stops there, so it
+        // would block every later message, sound included. 0xD is the GBA-slot
+        // (CTRDG) service, which melonDS's HLE answers with the same 0x1.
+        HLE_SERVICE_MASK = 0xFFFFFFFFu;
+        break;
+    default:
+        HLE_SERVICE_MASK = (1u << 0x7);   // sound only
+        break;
+    }
+}
 bool HLE_handles(u32 service)
 {
     return (HLE_SERVICE_MASK >> (service & 0x1F)) & 1u;
@@ -274,8 +385,11 @@ void Touchscreen_Sample()
     else
     {
         ts &= 0xF9000000;
-        ts |= (nds.scr_touchX & 0xFFF);
-        ts |= ((nds.scr_touchY & 0xFFF) << 12);
+        // scr_touchX/Y are screen coords shifted left by 4 (NDS_setTouchPosDirect),
+        // but this field is plain pixels: 0-255 and 0-191. Writing the shifted
+        // value put every touch 16x off scale, i.e. off the screen entirely.
+        ts |= ((nds.scr_touchX >> 4) & 0xFFF);
+        ts |= (((nds.scr_touchY >> 4) & 0xFFF) << 12);
         ts |= 0x01000000;
     }
 
@@ -670,7 +784,9 @@ void OnIPCRequest_Sound(u32 data)
             // Stop claiming sound entirely. The rollback below would keep this
             // game working anyway, but it would pay a claim-and-roll-back on
             // every sound message forever; dropping the service does it once.
-            HLE_SERVICE_MASK &= ~(1u << 0x7);
+            // Parked, there is no core to take it: keep claiming (and dropping).
+            if (!g_arm7_core_parked)
+                HLE_SERVICE_MASK &= ~(1u << 0x7);
         }
     }
 
@@ -774,22 +890,33 @@ static bool HLE_TryClaimIPC()
     if (ipc_fifo[ARMCPU_ARM9].size == 0)
         return false;
 
+    // A parked core never runs its FIFO init, so enable the ARM7 side on its
+    // behalf -- otherwise nothing is claimed and IPC_FIFOsend drops every reply.
+    if (g_arm7_core_parked)
+        IPCFIFOCnt7 |= IPCFIFOCNT_FIFOENABLE;
+
     // Both FIFOENABLE bits must be set. Claiming reads through
     // IPC_FIFOrecv(ARMCPU_ARM7), which checks the ARM7's own enable bit and
     // returns 0 WITHOUT consuming when it is clear -- OnIPCRequest() then bails
     // on val==0 while we report success, and HLE_DrainIPC()'s loop spins on the
     // same message forever. That was the black screen with a live fps counter.
-    if (!(IPCFIFOCnt9 & IPCFIFOCNT_FIFOENABLE))
+    if (!(IPCFIFOCnt9 & IPCFIFOCNT_FIFOENABLE) || !(IPCFIFOCnt7 & IPCFIFOCNT_FIFOENABLE))
+    {
+        hle_log("claim refused: FIFO disabled cnt9=%04X cnt7=%04X q9=%u\n",
+                (unsigned)(u16)IPCFIFOCnt9, (unsigned)(u16)IPCFIFOCnt7,
+                (unsigned)ipc_fifo[ARMCPU_ARM9].size);
         return false;
-    if (!(IPCFIFOCnt7 & IPCFIFOCNT_FIFOENABLE))
-        return false;
+    }
 
     // Peek: head is the oldest queued word, which is the one the ARM7 would read.
     const u32 val = ipc_fifo[ARMCPU_ARM9].buf[ipc_fifo[ARMCPU_ARM9].head];
     const u32 service = val & 0x1F;
 
     if (!HLE_handles(service))
+    {
+        hle_log("claim refused: svc %X not handled (val=%08X)\n", (unsigned)service, (unsigned)val);
         return false;   // belongs to the real ARM7 core -- leave it alone
+    }
 
     // Claim it as a transaction. Several HLE handlers silently do nothing for
     // inputs they do not model (an empty else branch, an early `if (flag)`, an
@@ -812,7 +939,8 @@ static bool HLE_TryClaimIPC()
     const bool consumed = ipc_fifo[ARMCPU_ARM9].size < size_before;
     const bool replied  = ipc_fifo[ARMCPU_ARM7].size > reply_before;
 
-    if (consumed && !replied && HLE_ReplyMeansHandled(service))
+    // No rollback when parked: there is no core to hand the message back to.
+    if (consumed && !replied && HLE_ReplyMeansHandled(service) && !g_arm7_core_parked)
     {
         // Roll back: restore head/size so the message is queued again. Nothing
         // else has run in between -- OnIPCRequest() is synchronous and the ARM7
@@ -898,6 +1026,9 @@ void OnIPCRequest()
     u32 data = val >> 6;
     bool flag = ((val >> 5) & 0x1) != 0;
 
+    hle_log("req svc=%X data=%08X flag=%d  a9pc=%08X\n", (unsigned)service, (unsigned)data,
+            (int)flag, (unsigned)NDS_ARM9.instruct_adr);
+
     // Second line of defence. HLE_TryClaimIPC() already checked the mask before
     // consuming, so this should never fire -- but OnIPCRequest() consumes from
     // the FIFO, so if it were ever reached for a service the real ARM7 owns it
@@ -969,7 +1100,7 @@ void OnIPCRequest()
         break;
 
     default:
-        printf("HLE: unknown IPC request %08X service=%02X data=%08X flag=%d\n", val, service, data, flag);
+        hle_log("  UNKNOWN service, dropped\n");
         break;
     }
 }
@@ -1007,10 +1138,25 @@ void StartScanline(u16 line)
 #define HW_INTR_CHECK_BUF           (HW_PRV_WRAM_SYSRV + 0x38)
 
 void executeARM7Stuff(){
-    // Once the real ARM7 core runs it does this housekeeping itself; doing both
-    // would fight over the shared WRAM locations below.
-    if (arm7_core_active)
+    // Gate on whether the core is actually RUNNING, not on arm7_core_active.
+    // arm7_core_active is a compile-time constant that says "a real core
+    // exists"; with mode 3 the core exists but is parked, and then neither side
+    // did this housekeeping -- the keypad state, the frame counter and the TWL
+    // sync flags all stopped updating, which is what hangs.
+    if (!g_arm7_core_parked)
         return;
+
+    static u32 vbl = 0;
+    if (vbl++ % 60 == 0)
+        hle_log("[%us] a9pc=%08X frz=%X sync9=%04X sync7=%04X cnt9=%04X cnt7=%04X q9=%u q7=%u "
+                "IME=%u IE=%08X IF=%08X rdy=%08X\n",
+                (unsigned)(vbl / 60), (unsigned)NDS_ARM9.instruct_adr, (unsigned)NDS_ARM9.freeze,
+                (unsigned)(u16)IPCSync9, (unsigned)(u16)IPCSync7,
+                (unsigned)(u16)IPCFIFOCnt9, (unsigned)(u16)IPCFIFOCnt7,
+                (unsigned)ipc_fifo[ARMCPU_ARM9].size, (unsigned)ipc_fifo[ARMCPU_ARM7].size,
+                (unsigned)MMU.reg_IME[ARMCPU_ARM9], (unsigned)MMU.reg_IE[ARMCPU_ARM9],
+                (unsigned)MMU.gen_IF<ARMCPU_ARM9>(),
+                (unsigned)_MMU_read32<ARMCPU_ARM7>(0x027FFF8C));
 
     extern u16 get_keypad();
 	// 0x027FFFA8 holds ext key state: bits 10=X, 11=Y, 13=lid
@@ -1045,17 +1191,18 @@ void executeARM7Stuff(){
 }
 
 void HLE_IPCSYNC(){
-    // The boot handshake is itself an HLE service: when the real ARM7 core is
-    // running it performs its own handshake, and answering as well makes the
-    // two fight over IPCSync (the ARM7 posts a value the HLE state machine does
-    // not know, gets no reply, and retries forever).
-    if (arm7_core_active)
+    // Same correction as executeARM7Stuff: the danger is two handshakes
+    // fighting, which only happens while the core RUNS. Parked, the HLE is the
+    // only candidate, and refusing here leaves the ARM9 waiting on IPCSync
+    // forever -- an obvious hang at boot.
+    if (!g_arm7_core_parked)
         return;
 
     u8 val = IPCSync7 & 0xF;
 
-    printf("[HLE] HLE_IPCSYNC: IPCSync7=0x%04X IPCSync9=0x%04X val=%d\n",
-        IPCSync7, IPCSync9, val);
+    hle_log("ipcsync sync7=%04X sync9=%04X val=%d a9pc=%08X\n",
+            (unsigned)(u16)IPCSync7, (unsigned)(u16)IPCSync9, (int)val,
+            (unsigned)NDS_ARM9.instruct_adr);
 
     if (val < 5)
     {

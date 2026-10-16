@@ -51,8 +51,12 @@ extern SETTINGS settings[MAX_SETTINGS];
 extern int totalSettings;       // number of main (per-ROM) settings
 
 // Experimental optimizations tab (separate array from settings[]).
-#define MAX_EXP_SETTINGS 12
+#define MAX_EXP_SETTINGS 16   // 9 toggles + the two per-CPU JIT-mode rows
 extern SETTINGS expSettings[MAX_EXP_SETTINGS];
+// Rows in expSettings[] holding a 0..3 JIT mode rather than a bool (-1 if unset).
+extern int g_arm9_mode_idx;
+extern int g_arm7_mode_idx;
+extern int g_arm7_hle_idx;
 extern int totalExp;
 void InitExperimentalSettings(configured_features *params);
 void FinalizeExperimental(configured_features *params);
